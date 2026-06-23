@@ -11,13 +11,13 @@ const SOURCE_TYPES = {
     label: "Official",
     className: "ok",
     installAllowed: true,
-    description: "Echte Installation",
+    description: "Native console installation",
   },
   external: {
     label: "External",
     className: "external",
     installAllowed: true,
-    description: "Echte externe Installation",
+    description: "Real external installation",
   },
   shadowmount: {
     label: "Shadowmount",
@@ -29,7 +29,7 @@ const SOURCE_TYPES = {
     label: "Unknown",
     className: "blocked",
     installAllowed: false,
-    description: "Blockiert",
+    description: "Blocked",
   },
 };
 
@@ -37,7 +37,7 @@ const fallback = {
   status: {
     firmware: "11.60",
     firmware_build: "0x11600000",
-    dns_guard: "Aktiv",
+    dns_guard: "Active",
     resolver: "Internal allowlist",
     free_space_mb: 64218,
     download_dir: "/mnt/usb0/patches",
@@ -132,7 +132,7 @@ const fallback = {
       name: "Demon's Souls",
       version: "01.004.000",
       progress: 64,
-      detail: "4.8 GB von 7.5 GB",
+      detail: "4.8 GB of 7.5 GB",
     },
   ],
   logs: [
@@ -204,7 +204,7 @@ function bindEvents() {
 
   els.refreshBtn.addEventListener("click", loadInitialData);
   els.saveBtn.addEventListener("click", saveConfig);
-  els.pauseAllBtn.addEventListener("click", () => showToast("Queue wurde pausiert."));
+  els.pauseAllBtn.addEventListener("click", () => showToast("Queue paused."));
 }
 
 async function loadInitialData() {
@@ -224,7 +224,7 @@ async function loadInitialData() {
   };
 
   render();
-  showToast(state.usingFallback ? "Demo-Daten geladen. API noch nicht erreichbar." : "Daten aktualisiert.");
+  showToast(state.usingFallback ? "Demo data loaded. API is not reachable yet." : "Data refreshed.");
 }
 
 async function getJson(url, fallbackValue) {
@@ -248,11 +248,11 @@ function render() {
 
 function renderStatus() {
   els.firmwareValue.textContent = state.status.firmware || "--";
-  els.firmwareBuild.textContent = state.status.firmware_build || "Systemversion";
+  els.firmwareBuild.textContent = state.status.firmware_build || "System version";
   els.dnsValue.textContent = state.status.dns_guard || "--";
   els.resolverValue.textContent = state.status.resolver || "--";
   els.spaceValue.textContent = formatMb(state.status.free_space_mb);
-  els.downloadDirValue.textContent = state.status.download_dir || state.config.download_dir || "Download Ziel";
+  els.downloadDirValue.textContent = state.status.download_dir || state.config.download_dir || "Download target";
 }
 
 function renderSettings() {
@@ -276,7 +276,7 @@ function renderGames() {
   if (!visible.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "Keine Titel fuer diesen Filter.";
+    empty.textContent = "No titles match this filter.";
     els.gameGrid.appendChild(empty);
     return;
   }
@@ -319,8 +319,8 @@ function createGameCard(game) {
       <div class="subline" style="margin-top:8px">
         ${statusPill(game)}
         ${sourcePill(game)}
-        ${installBlocked ? `<span class="pill blocked">Install gesperrt</span>` : `<span class="pill ok">Install erlaubt</span>`}
-        <span class="pill">${game.enabled ? "Aktiv" : "Aus"}</span>
+        ${installBlocked ? `<span class="pill blocked">Install blocked</span>` : `<span class="pill ok">Install allowed</span>`}
+        <span class="pill">${game.enabled ? "Enabled" : "Off"}</span>
       </div>
       <div class="source-path">${escapeHtml(sourceDetail(game))}</div>
     </div>
@@ -329,9 +329,9 @@ function createGameCard(game) {
   const versions = document.createElement("div");
   versions.className = "version-grid";
   versions.innerHTML = `
-    ${versionBox("Installiert", game.installed_version || "--")}
-    ${versionBox("Kompatibel", game.compatible_version || "Keine")}
-    ${versionBox("Neueste", `${game.latest_version || "--"} / FW ${game.latest_required_fw || "--"}`)}
+    ${versionBox("Installed", game.installed_version || "--")}
+    ${versionBox("Compatible", game.compatible_version || "None")}
+    ${versionBox("Latest", `${game.latest_version || "--"} / FW ${game.latest_required_fw || "--"}`)}
   `;
 
   const controls = document.createElement("div");
@@ -341,7 +341,7 @@ function createGameCard(game) {
   controlRow.className = "control-row";
 
   const mode = document.createElement("select");
-  mode.title = "Update-Modus";
+  mode.title = "Update mode";
   [
     ["disabled", "Disabled"],
     ["download_only", "Download only"],
@@ -358,7 +358,7 @@ function createGameCard(game) {
   mode.addEventListener("change", () => updateGame(game.title_id, { mode: mode.value, enabled: mode.value !== "disabled" }));
 
   const pin = document.createElement("input");
-  pin.title = "Maximale Content-Version";
+  pin.title = "Maximum content version";
   pin.placeholder = "max ver";
   pin.value = game.max_content_ver || "";
   pin.addEventListener("change", () => updateGame(game.title_id, { max_content_ver: pin.value.trim() }));
@@ -370,11 +370,11 @@ function createGameCard(game) {
   actions.innerHTML = `
     <button class="row-button" data-action="check">
       <svg><use href="#icon-refresh"></use></svg>
-      Pruefen
+      Check
     </button>
     <button class="row-button is-primary" data-action="download" ${!isDownloadAllowed(game) ? "disabled" : ""} title="${escapeHtml(downloadTitle(game))}">
       <svg><use href="#icon-download"></use></svg>
-      Laden
+      Download
     </button>
   `;
 
@@ -399,8 +399,8 @@ function versionBox(label, value) {
 function statusPill(game) {
   if (game.status === "blocked") return `<span class="pill blocked">${escapeHtml(blockedLabel(game))}</span>`;
   if (game.status === "queued") return `<span class="pill warn">In Queue</span>`;
-  if (game.status === "available") return `<span class="pill ok">Update verfuegbar</span>`;
-  return `<span class="pill">Aktuell</span>`;
+  if (game.status === "available") return `<span class="pill ok">Update available</span>`;
+  return `<span class="pill">Current</span>`;
 }
 
 function sourcePill(game) {
@@ -418,16 +418,16 @@ function sourceType(game) {
 
 function sourceDetail(game) {
   const src = sourceType(game);
-  if (src === "shadowmount") return `Mount: ${game.mount_from || "unbekannte Quelle"}`;
-  if (src === "external") return `External: ${game.source_path || "externe App-Metadaten"}`;
-  if (src === "official") return game.source_path || "Offizielle Installation";
-  return "Quelle nicht eindeutig erkannt";
+  if (src === "shadowmount") return `Mount: ${game.mount_from || "unknown source"}`;
+  if (src === "external") return `External: ${game.source_path || "external app metadata"}`;
+  if (src === "official") return game.source_path || "Official installation";
+  return "Source could not be identified";
 }
 
 function blockedLabel(game) {
-  if (sourceType(game) === "unknown") return "Quelle unbekannt";
-  if (!game.compatible_version) return "FW blockiert";
-  return "Blockiert";
+  if (sourceType(game) === "unknown") return "Unknown source";
+  if (!game.compatible_version) return "FW blocked";
+  return "Blocked";
 }
 
 function renderQueue() {
@@ -435,7 +435,7 @@ function renderQueue() {
   if (!state.downloads.length) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "Keine aktiven Downloads.";
+    empty.textContent = "No active downloads.";
     els.queueList.appendChild(empty);
     return;
   }
@@ -463,8 +463,8 @@ function renderSourcePolicies() {
     row.className = "policy-row";
     row.innerHTML = `
       <span class="pill ${info.className}">${escapeHtml(info.label)}</span>
-      <strong>${policy.allow_install ? "Install erlaubt" : "Install gesperrt"}</strong>
-      <em>${policy.allow_download ? "Download erlaubt" : "Download gesperrt"} - ${escapeHtml(info.description)}</em>
+      <strong>${policy.allow_install ? "Install allowed" : "Install blocked"}</strong>
+      <em>${policy.allow_download ? "Download allowed" : "Download blocked"} - ${escapeHtml(info.description)}</em>
     `;
     return row;
   });
@@ -487,10 +487,10 @@ async function saveConfig() {
   try {
     await postJson(API.config, config);
     state.config = config;
-    showToast("Konfiguration gespeichert.");
+    showToast("Configuration saved.");
   } catch (error) {
     state.config = config;
-    showToast("Konfiguration lokal aktualisiert. API noch nicht erreichbar.");
+    showToast("Configuration updated locally. API is not reachable yet.");
   }
 
   renderSettings();
@@ -513,8 +513,8 @@ async function runTitleAction(titleId, action) {
 
   if (action === "download" && game.compatible_version) {
     const detail = isInstallBlocked(game)
-      ? "Download only - Install durch Source-Policy gesperrt"
-      : "Wartet auf Start";
+      ? "Download only - install blocked by source policy"
+      : "Waiting to start";
     game.queued = true;
     game.status = "queued";
     if (!state.downloads.some((item) => item.title_id === titleId)) {
@@ -527,10 +527,10 @@ async function runTitleAction(titleId, action) {
       });
     }
     state.logs.push(`[${timeNow()}] Queued ${game.title_id} ${game.compatible_version} (${sourceType(game)}, install=${isInstallBlocked(game) ? "blocked" : "allowed"})`);
-    showToast(`${game.title_id} wurde zur Queue hinzugefuegt.`);
+    showToast(`${game.title_id} was added to the queue.`);
   } else {
     state.logs.push(`[${timeNow()}] Check requested for ${game.title_id}`);
-    showToast(`${game.title_id} wird geprueft.`);
+    showToast(`${game.title_id} check queued.`);
   }
 
   renderGames();
@@ -544,7 +544,7 @@ function updateGame(titleId, patch) {
   if (sourceType(game) === "unknown" && patch.mode && !["disabled", "check_only"].includes(patch.mode)) {
     patch.mode = "check_only";
     patch.enabled = true;
-    showToast(`${titleId}: Quelle unbekannt, nur Check only erlaubt.`);
+    showToast(`${titleId}: unknown source, check only is allowed.`);
   }
   Object.assign(game, patch);
   if (patch.mode === "disabled") game.enabled = false;
@@ -573,11 +573,11 @@ function sourcePolicyForType(type) {
 }
 
 function downloadTitle(game) {
-  if (!game.enabled) return "Titel ist deaktiviert.";
-  if (!game.compatible_version) return "Keine kompatible Update-Version verfuegbar.";
-  if (!sourcePolicy(game).allow_download) return "Download ist fuer diese Quelle gesperrt.";
-  if (isInstallBlocked(game)) return "Download erlaubt, Installation bleibt fuer diese Quelle gesperrt.";
-  return "Kompatibles Update laden.";
+  if (!game.enabled) return "Title is disabled.";
+  if (!game.compatible_version) return "No compatible update version is available.";
+  if (!sourcePolicy(game).allow_download) return "Downloads are blocked for this source.";
+  if (isInstallBlocked(game)) return "Download allowed; installs stay blocked for this source.";
+  return "Download compatible update.";
 }
 
 async function postJson(url, body) {
@@ -620,7 +620,7 @@ function clone(value) {
 }
 
 function timeNow() {
-  return new Date().toLocaleTimeString("de-DE", { hour12: false });
+  return new Date().toLocaleTimeString("en-US", { hour12: false });
 }
 
 let toastTimer;

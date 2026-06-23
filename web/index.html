@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="de">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -60,7 +60,7 @@
         <nav class="nav-list">
           <a class="nav-link is-active" href="#games">
             <svg><use href="#icon-download"></use></svg>
-            Spiele
+            Games
           </a>
           <a class="nav-link" href="#downloads">
             <svg><use href="#icon-refresh"></use></svg>
@@ -81,54 +81,54 @@
         <header class="topbar">
           <div>
             <p class="eyebrow">Standalone ELF Web UI</p>
-            <h1>Spielupdates kontrolliert laden</h1>
+            <h1>Controlled game patch downloads</h1>
           </div>
           <div class="topbar-actions">
-            <button class="icon-button" id="refreshBtn" title="Status und Spiele neu pruefen">
+            <button class="icon-button" id="refreshBtn" title="Refresh status and games">
               <svg><use href="#icon-refresh"></use></svg>
             </button>
             <button class="primary-button" id="saveBtn">
               <svg><use href="#icon-save"></use></svg>
-              Speichern
+              Save
             </button>
           </div>
         </header>
 
-        <section class="status-strip" aria-label="Systemstatus">
+        <section class="status-strip" aria-label="System status">
           <article class="metric">
             <span>Firmware</span>
             <strong id="firmwareValue">--</strong>
-            <em id="firmwareBuild">Systemversion</em>
+            <em id="firmwareBuild">System version</em>
           </article>
           <article class="metric">
             <span>DNS Guard</span>
             <strong id="dnsValue">--</strong>
-            <em>Sony blockiert per nanoDNS</em>
+            <em>Sony blocked by nanoDNS</em>
           </article>
           <article class="metric">
-            <span>CDN Zugriff</span>
+            <span>CDN Access</span>
             <strong id="resolverValue">--</strong>
-            <em>Nur PatchDL Resolver</em>
+            <em>PatchDL resolver only</em>
           </article>
           <article class="metric">
-            <span>Speicher</span>
+            <span>Storage</span>
             <strong id="spaceValue">--</strong>
-            <em id="downloadDirValue">Download Ziel</em>
+            <em id="downloadDirValue">Download target</em>
           </article>
         </section>
 
         <section class="toolbar" id="games">
           <div class="search-box">
             <svg><use href="#icon-search"></use></svg>
-            <input id="searchInput" type="search" placeholder="Titel, Title ID oder Content ID suchen" />
+            <input id="searchInput" type="search" placeholder="Search title, Title ID, or Content ID" />
           </div>
 
           <div class="segmented" role="tablist" aria-label="Filter">
-            <button class="is-selected" data-filter="all">Alle</button>
-            <button data-filter="enabled">Aktiv</button>
+            <button class="is-selected" data-filter="all">All</button>
+            <button data-filter="enabled">Enabled</button>
             <button data-filter="available">Updates</button>
             <button data-filter="shadowmount">Shadow</button>
-            <button data-filter="blocked">Blockiert</button>
+            <button data-filter="blocked">Blocked</button>
             <button data-filter="queued">Queue</button>
           </div>
         </section>
@@ -140,7 +140,7 @@
             <div class="panel-heading">
               <div>
                 <p class="eyebrow">Downloads</p>
-                <h2>Aktive Queue</h2>
+                <h2>Active Queue</h2>
               </div>
               <button class="ghost-button" id="pauseAllBtn">
                 <svg><use href="#icon-pause"></use></svg>
@@ -154,7 +154,7 @@
             <div class="panel-heading">
               <div>
                 <p class="eyebrow">Policy</p>
-                <h2>Update Regeln</h2>
+                <h2>Update Rules</h2>
               </div>
             </div>
 
@@ -167,32 +167,32 @@
                 </select>
               </label>
               <label class="field">
-                <span>Download Ordner</span>
+                <span>Download Folder</span>
                 <input id="downloadDir" type="text" spellcheck="false" />
               </label>
               <label class="switch-row">
                 <input id="installAfterDownload" type="checkbox" />
                 <span>
-                  <strong>Nach Download installieren</strong>
-                  <em>Globaler Default, pro Spiel ueberschreibbar</em>
+                  <strong>Install after download</strong>
+                  <em>Global default, overridable per game</em>
                 </span>
               </label>
               <label class="switch-row">
                 <input id="deleteAfterInstall" type="checkbox" />
                 <span>
-                  <strong>PKG nach Installation loeschen</strong>
-                  <em>Nur wenn Installation erfolgreich war</em>
+                  <strong>Delete PKG after install</strong>
+                  <em>Only after a successful install</em>
                 </span>
               </label>
             </div>
 
             <div class="allowlist">
-              <span>Interne CDN Allowlist</span>
+              <span>Internal CDN Allowlist</span>
               <div id="allowlistHosts"></div>
             </div>
 
             <div class="source-policy">
-              <span>Install Schutz</span>
+              <span>Install Protection</span>
               <div id="sourcePolicyList"></div>
             </div>
           </div>
@@ -202,7 +202,7 @@
           <div class="panel-heading">
             <div>
               <p class="eyebrow">Runtime</p>
-              <h2>Letzte Ereignisse</h2>
+              <h2>Recent Events</h2>
             </div>
           </div>
           <pre id="logOutput" tabindex="0"></pre>

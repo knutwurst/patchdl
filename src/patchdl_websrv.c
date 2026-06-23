@@ -13,7 +13,7 @@ static const char status_json[] =
   "{"
   "\"firmware\":\"11.60\","
   "\"firmware_build\":\"0x11600000\","
-  "\"dns_guard\":\"Aktiv\","
+  "\"dns_guard\":\"Active\","
   "\"resolver\":\"Internal allowlist\","
   "\"free_space_mb\":64218,"
   "\"download_dir\":\"/mnt/usb0/patches\""
