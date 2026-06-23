@@ -1,0 +1,40 @@
+PS5_HOST ?= ps5
+PS5_PORT ?= 9021
+PATCHDL_HTTP_PORT ?= 12880
+
+ifdef PS5_PAYLOAD_SDK
+    include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
+else
+    $(error PS5_PAYLOAD_SDK is undefined)
+endif
+
+PYTHON ?= python3
+BIN := patchdl-ps5.elf
+
+SRCS := src/main.c src/patchdl_assets.c src/patchdl_websrv.c
+
+WEB_ASSETS := web/index.html web/styles.css web/app.js
+GEN_SRCS := $(patsubst web/%,gen/web/%.c,$(WEB_ASSETS))
+
+CFLAGS := -g -O2 -Wall -Werror -Isrc -DPATCHDL_HTTP_PORT=$(PATCHDL_HTTP_PORT)
+LDADD := -lkernel_sys
+LDADD += `$(PS5_PAYLOAD_SDK)/bin/prospero-pkg-config libmicrohttpd --libs`
+
+all: $(BIN)
+
+gen/web:
+	mkdir -p gen/web
+
+gen/web/%.c: web/% scripts/gen_asset_module.py | gen/web
+	$(PYTHON) scripts/gen_asset_module.py --path $* $< > $@
+
+$(BIN): $(SRCS) $(GEN_SRCS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDADD)
+
+test: $(BIN)
+	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^
+
+clean:
+	rm -rf $(BIN) gen
+
+.PHONY: all clean test

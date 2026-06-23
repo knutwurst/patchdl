@@ -6,6 +6,8 @@ Open `index.html` directly for the mock UI, or serve this directory from the
 ELF web server. The JavaScript first tries the real API and falls back to demo
 data when the API is not available.
 
+The embedded ELF server serves this UI on port `12880` by default.
+
 ## Expected API
 
 ```text

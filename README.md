@@ -31,9 +31,40 @@ and `nullfs` mount origins instead of trusting title IDs alone.
 ## Current Contents
 
 ```text
+Makefile
+  PS5 payload build using ps5-payload-sdk and libmicrohttpd.
+
+src/
+  Embedded web server entrypoint and API stubs.
+
 web/
   Static web UI prototype for the future embedded PatchDL web server.
 ```
 
 Open `web/index.html` directly for the mock UI, or serve `web/` from a local
 HTTP server.
+
+## Embedded Web Server
+
+PatchDL is intended to run one self-contained ELF. It does not need a second
+`websrv.elf` process. The payload starts its own libmicrohttpd server and serves
+the UI from compiled-in assets.
+
+Default port:
+
+```text
+http://PS5_IP:12880/
+```
+
+The port can be changed at build time:
+
+```sh
+make PATCHDL_HTTP_PORT=12881
+```
+
+or at runtime by passing a port as the first argument, if the loader supports
+argv:
+
+```sh
+patchdl-ps5.elf 12881
+```
