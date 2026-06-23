@@ -415,8 +415,13 @@ patchdl_scan(patchdl_title_t **titles_out, size_t *count_out) {
     root_vnode = kernel_get_root_vnode();
     if (root_vnode) {
         saved_root = kernel_get_proc_rootdir(pid);
-        kernel_set_proc_rootdir(pid, root_vnode);
-        using_vswap = 1;
+        /* Only swap if we captured the current root, so we can always restore
+           it. Leaving the process rooted at the system root would make later
+           absolute-path writes land in the wrong place. */
+        if (saved_root) {
+            kernel_set_proc_rootdir(pid, root_vnode);
+            using_vswap = 1;
+        }
     }
 
     for (int i = 0; SCAN_DIRS[i]; i++)
@@ -486,8 +491,11 @@ patchdl_scan_debug_json(void) {
     root_vnode = kernel_get_root_vnode();
     if (root_vnode) {
         saved_root = kernel_get_proc_rootdir(pid);
-        kernel_set_proc_rootdir(pid, root_vnode);
-        using_vswap = 1;
+        /* Only swap if we can restore it afterwards (see patchdl_scan). */
+        if (saved_root) {
+            kernel_set_proc_rootdir(pid, root_vnode);
+            using_vswap = 1;
+        }
     }
 
     for (int i = 0; SCAN_DIRS[i]; i++) {

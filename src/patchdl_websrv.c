@@ -644,6 +644,8 @@ static void
 cleanup_installed_download(const char *title_id, const char *patch_url) {
     char        dir[256], path[320];
     const char *base = strrchr(patch_url, '/');
+    if (!path_segment_safe(title_id))
+        return;
     base = base ? base + 1 : "patch.pkg";
     snprintf(dir, sizeof(dir), "/data/patchdl/%s", title_id);
     snprintf(path, sizeof(path), "%s/%s", dir, base);
@@ -799,6 +801,12 @@ remove_title_dir(const char *title_id) {
     char           dir[288], path[560];
     DIR           *d;
     struct dirent *e;
+
+    /* Self-protecting: never build a delete path from an unsafe segment, even
+       if a future caller forgets the upstream check. A title_id of ".." would
+       otherwise resolve dir to /data and wipe it. */
+    if (!path_segment_safe(title_id))
+        return;
 
     snprintf(dir, sizeof(dir), "%s/%s", PATCHDL_DL_DIR, title_id);
     if ((d = opendir(dir))) {
@@ -1005,6 +1013,14 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
     if (parse_title_action(url, title_id, sizeof(title_id),
                            action, sizeof(action)))
         return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
+
+    /* Defense in depth: title_id becomes part of /data/patchdl/<id> paths that
+       get created, written, and recursively deleted. Reject anything that
+       isn't a plain id BEFORE it can reach mkdir/unlink/rmdir, so no request
+       can ever escape the download directory (a title_id of ".." would resolve
+       the dir to /data). Real PS5 title ids only use [A-Za-z0-9_-.]. */
+    if (!path_segment_safe(title_id))
+        return queue_text(conn, MHD_HTTP_FORBIDDEN, "forbidden");
 
     if (!get_title_action_info(title_id, &src, patch_url, sizeof(patch_url),
                                patch_title_id, sizeof(patch_title_id),
