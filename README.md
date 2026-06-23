@@ -1,111 +1,77 @@
 # PatchDL
 
-PatchDL is a planned standalone PS5 ELF payload for controlled official game
-patch downloads.
+A standalone PlayStation 5 ELF payload that downloads and installs official game
+patches on your terms. It serves its own web UI and runs without etaHEN.
 
-The target design is deny-by-default:
+PatchDL is built for setups where nanoDNS blocks Sony's servers for the whole
+console. It resolves the Sony patch CDN on its own path, so the rest of the
+system stays offline and only the patches you pick get fetched.
 
-- Sony domains stay blocked by nanoDNS for the normal PS5 system.
-- PatchDL uses its own internal allowlist resolver for Sony CDN hosts.
-- Games must be explicitly enabled before PatchDL checks or downloads updates.
-- Patch selection is capped to the highest update compatible with the current
-  firmware.
-- Install actions are source-aware: shadowmounted and unknown titles are never
-  installed by PatchDL.
+by Knutwurst
 
-## Source Classification
+## What it does
 
-PatchDL treats the title source as part of the safety policy:
+- Scans installed titles and classifies each one: genuine install,
+  ShadowMountPlus mount, preinstall, or unknown.
+- Reads the title name, installed version, and the Sony `version.xml` URL from
+  the PS5 app database.
+- Fetches each title's `version.xml` from Sony's CDN past nanoDNS (a raw DNS
+  query to 1.1.1.1) and verifies TLS against the pinned SCEI DNAS root.
+- Picks the newest patch compatible with the current firmware
+  (`system_ver <= firmware`), so an update never forces a firmware upgrade.
+- Downloads the patch package and installs it through Sony's AppInstUtil
+  service.
+
+## Safety model
+
+Deny-by-default. A patch is installed only for a genuine install, and only when
+the package's title id matches the installed game:
+
+| Source                | Check | Download | Install |
+|-----------------------|-------|----------|---------|
+| official              | yes   | yes      | yes     |
+| shadowmount           | yes   | yes      | no      |
+| preinstall / unknown  | yes   | no       | no      |
+
+Two independent guards stop the wrong package being installed: the patch's title
+id (read from its download URL) must match the game, and just before install the
+real title id is read back from the package
+(`sceAppInstUtilGetTitleIdFromPkg`) and checked again. A cross-region or
+cross-title package is refused instead of installed as a phantom title.
+
+## Build
+
+Requires `ps5-payload-dev/sdk`. The network and install features also need the
+prebuilt libcurl + OpenSSL from `ps5-payload-dev/pacbrew-repo` placed in the SDK
+sysroot (`target/user/homebrew`); `scripts/build_ps5.sh` enables them
+automatically when present. libmicrohttpd is vendored under `vendor/etahen`, and
+SQLite is vendored under `vendor/sqlite`.
+
+```sh
+scripts/build_ps5.sh        # produces patchdl-ps5.elf
+```
+
+## Deploy
+
+This console uses the BD-JB autoloader with itsPLK's Payload Manager on port
+8084 (not a 9021 elfldr). `scripts/deploy_ps5.sh` uploads the ELF named with its
+version and launches it; the payload replaces any running instance itself.
+
+```sh
+PS5_HOST=<console-ip> scripts/deploy_ps5.sh
+```
+
+On start it shows an on-screen notification with the URL. Open the web UI at:
 
 ```text
-official     check/download/install allowed
-external     check/download/install allowed when detected as a real install
-shadowmount  check/download allowed, install blocked
-unknown      check allowed, download/install blocked
+http://<console-ip>:12880/
 ```
 
-The future ELF scanner should classify titles by app metadata plus mount table
-inspection. Shadowmounts should be detected through `statfs()` / `getfsstat()`
-and `nullfs` mount origins instead of trusting title IDs alone.
+## Status
 
-## Current Contents
-
-```text
-Makefile
-  PS5 payload build using ps5-payload-sdk and libmicrohttpd.
-
-src/
-  Embedded web server entrypoint and API stubs.
-
-vendor/etahen/
-  Vendored libmicrohttpd header and static library required for standalone
-  builds.
-
-web/
-  Static web UI prototype for the future embedded PatchDL web server.
-```
-
-Open `web/index.html` directly for the mock UI, or serve `web/` from a local
-HTTP server.
-
-## Embedded Web Server
-
-PatchDL is intended to run one self-contained ELF. It does not need a second
-`websrv.elf` process. The payload starts its own libmicrohttpd server and serves
-the UI from compiled-in assets.
-
-Default port:
-
-```text
-http://PS5_IP:12880/
-```
-
-The port can be changed at build time:
-
-```sh
-make PATCHDL_HTTP_PORT=12881
-```
-
-or at runtime by passing a port as the first argument, if the loader supports
-argv:
-
-```sh
-patchdl-ps5.elf 12881
-```
-
-## Building
-
-PatchDL builds against `ps5-payload-dev/sdk` and reuses etaHEN's checked-in
-`libmicrohttpd.a` plus header files. The required etaHEN build dependency is
-vendored in this repository:
-
-```text
-vendor/etahen/include/microhttpd.h
-vendor/etahen/lib/libmicrohttpd.a
-```
-
-If the SDK is unpacked into `.toolchains/ps5-payload-sdk/ps5-payload-sdk`, the
-helper script sets the required environment automatically:
-
-```sh
-scripts/build_ps5.sh clean all
-```
-
-For a system-wide SDK install, set `PS5_PAYLOAD_SDK` yourself:
-
-```sh
-export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
-make clean all
-```
-
-Override paths and ports as needed:
-
-```sh
-make ETAHEN_DEPS_DIR="vendor/etahen" PATCHDL_HTTP_PORT=12881
-```
-
-Deploy with an ELF loader listening on the PS5:
-
-```sh
-PS5_HOST=192.168.178.90 PS5_PORT=9021 scripts/build_ps5.sh test
-```
+0.0.1, early. Title scan, version resolution, firmware-compatibility filtering,
+download, and install work and have been verified on firmware 11.60. Open items:
+the web UI marks a title "Installing…" but reads progress from the PS5's own
+notifications rather than a percentage; config persistence and a download queue
+are not built yet; disc-based games need the disc inserted for their patch to
+apply (a normal Sony requirement).

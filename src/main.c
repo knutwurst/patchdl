@@ -3,11 +3,16 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include "patchdl_notify.h"
+#include "patchdl_proc.h"
+#include "patchdl_version.h"
 #include "patchdl_websrv.h"
 
 #ifndef PATCHDL_HTTP_PORT
 #define PATCHDL_HTTP_PORT 12880
 #endif
+
+#define PATCHDL_PROC_NAME "patchdl.elf"
 
 int
 main(int argc, char** argv) {
@@ -22,12 +27,20 @@ main(int argc, char** argv) {
 
   signal(SIGPIPE, SIG_IGN);
 
-  printf("PatchDL starting web UI on port %u\n", port);
+  /* Identify ourselves in the PS5 process list and replace any stale
+     instance so re-deploys are idempotent and the HTTP port is free. */
+  patchdl_proc_set_name(PATCHDL_PROC_NAME);
+  patchdl_proc_kill_others(PATCHDL_PROC_NAME);
+
+  printf("PatchDL v%s starting web UI on port %u\n", PATCHDL_VERSION, port);
 
   if(patchdl_websrv_start(port)) {
     puts("PatchDL web server failed to start");
     return 1;
   }
+
+  /* On-screen debug notification with the URL to open. */
+  patchdl_notify_startup(port);
 
   while(1) {
     sleep(60);

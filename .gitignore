@@ -5,6 +5,10 @@ build/
 node_modules/
 gen/
 *.elf
+*.o
 __pycache__/
 *.pyc
 .toolchains/
+
+# AI process artifacts — keep local, never commit/push (specs, plans, design docs)
+docs/superpowers/

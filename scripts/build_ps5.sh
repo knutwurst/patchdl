@@ -27,4 +27,14 @@ else
 fi
 export PATH
 
+# Enable the libcurl/OpenSSL network path automatically when those static
+# libs have been installed into the SDK sysroot (the pacbrew homebrew prefix).
+if [ -z "${CURL_DIR:-}" ]; then
+  HBREW="$PS5_PAYLOAD_SDK/target/user/homebrew"
+  if [ -f "$HBREW/include/curl/curl.h" ] && [ -f "$HBREW/lib/libcurl.a" ]; then
+    CURL_DIR="$HBREW"
+    export CURL_DIR
+  fi
+fi
+
 exec make -C "$ROOT_DIR" "$@"

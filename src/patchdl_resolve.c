@@ -1,0 +1,64 @@
+#include "patchdl_resolve.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#define DB_PATH "/data/patchdl/db/ps5_xml.tsv"
+
+static int
+lookup_tsv(const char *title_id, char *url_out, size_t url_sz) {
+    FILE *fp;
+    char  line[1024];
+
+    fp = fopen(DB_PATH, "r");
+    if (!fp) return -1;
+
+    while (fgets(line, sizeof(line), fp)) {
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = '\0';
+        if (strcmp(line, title_id)) continue;
+
+        char *url = tab + 1;
+        size_t len = strlen(url);
+        while (len > 0 && (url[len - 1] == '\n' || url[len - 1] == '\r'))
+            url[--len] = '\0';
+        if (len == 0 || len >= url_sz) {
+            fclose(fp);
+            return -1;
+        }
+        memcpy(url_out, url, len + 1);
+        fclose(fp);
+        return 0;
+    }
+    fclose(fp);
+    return -1;
+}
+
+static int
+lookup_prosperopatches(const char *title_id, char *url_out, size_t url_sz) {
+    /* TODO: implement live lookup once API endpoint is confirmed on-device.
+       prosperopatches.com serves Sony CDN index links for PS5 titles. */
+    (void)title_id;
+    (void)url_out;
+    (void)url_sz;
+    return -1;
+}
+
+int
+patchdl_resolve_url(const char *title_id, char *url_out, size_t url_sz) {
+    if (!title_id) return -1;
+
+    /* Only PS5 native title IDs (PPSA/PPSE/PPSH/PPSJ/PPSC) */
+    if (strncmp(title_id, "PPSA", 4) &&
+        strncmp(title_id, "PPSE", 4) &&
+        strncmp(title_id, "PPSH", 4) &&
+        strncmp(title_id, "PPSJ", 4) &&
+        strncmp(title_id, "PPSC", 4))
+        return -1;
+
+    if (!lookup_tsv(title_id, url_out, url_sz))
+        return 0;
+
+    return lookup_prosperopatches(title_id, url_out, url_sz);
+}
