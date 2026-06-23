@@ -37,6 +37,10 @@ Makefile
 src/
   Embedded web server entrypoint and API stubs.
 
+vendor/etahen/
+  Vendored libmicrohttpd header and static library required for standalone
+  builds.
+
 web/
   Static web UI prototype for the future embedded PatchDL web server.
 ```
@@ -72,12 +76,12 @@ patchdl-ps5.elf 12881
 ## Building
 
 PatchDL builds against `ps5-payload-dev/sdk` and reuses etaHEN's checked-in
-`libmicrohttpd.a` plus header files. By default, the Makefile expects etaHEN's
-source tree next to this repository:
+`libmicrohttpd.a` plus header files. The required etaHEN build dependency is
+vendored in this repository:
 
 ```text
-../Source Code/include
-../Source Code/lib
+vendor/etahen/include/microhttpd.h
+vendor/etahen/lib/libmicrohttpd.a
 ```
 
 If the SDK is unpacked into `.toolchains/ps5-payload-sdk/ps5-payload-sdk`, the
@@ -97,11 +101,11 @@ make clean all
 Override paths and ports as needed:
 
 ```sh
-make ETAHEN_SOURCE_DIR="/path/to/etaHEN/Source Code" PATCHDL_HTTP_PORT=12881
+make ETAHEN_DEPS_DIR="vendor/etahen" PATCHDL_HTTP_PORT=12881
 ```
 
 Deploy with an ELF loader listening on the PS5:
 
 ```sh
-PS5_HOST=ps5 PS5_PORT=9021 scripts/build_ps5.sh test
+PS5_HOST=192.168.178.90 PS5_PORT=9021 scripts/build_ps5.sh test
 ```
