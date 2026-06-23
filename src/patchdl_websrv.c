@@ -9,6 +9,7 @@
 
 #include <microhttpd.h>
 #include <pthread.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,13 +25,26 @@ static size_t           g_title_count;
 static pthread_mutex_t  g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char             g_status_json[512];
 static char            *g_debug_json; /* built once at startup */
+static unsigned long    g_pkg_hits;
+static char             g_pkg_diag_json[768] = "{\"hits\":0}";
 
-static const char config_json[] =
-  "{"
-  "\"default_policy\":\"deny\","
-  "\"download_dir\":\"/mnt/usb0/patches\","
-  "\"install_after_download\":false,"
-  "\"delete_pkg_after_install\":false,"
+#define PATCHDL_DL_DIR    "/data/patchdl"
+#define PATCHDL_CFG_PATH  "/data/patchdl/config.json"
+
+/* Persisted, user-editable settings. Per-title enable/disable lives in the
+   title structs (t->enabled) so it travels with the scan; the global fields
+   live here. Both are saved to PATCHDL_CFG_PATH (homebrew data dir, never a
+   system file) and reloaded on the next start. Guarded by g_mutex. */
+static struct {
+    char default_policy[8];        /* "deny" | "allow" */
+    int  install_after_download;
+    int  delete_pkg_after_install;
+} g_cfg = { "deny", 0, 1 };
+
+/* The source policy and CDN allowlist are fixed (the safety model), so they
+   stay constant; only the four mutable fields above are user-controlled. */
+static const char config_tail_json[] =
+  "\"download_dir\":\"/data/patchdl (internal)\","
   "\"source_policy\":{"
   "\"official\":{\"allow_check\":true,\"allow_download\":true,\"allow_install\":true},"
   "\"external\":{\"allow_check\":true,\"allow_download\":true,\"allow_install\":true},"
@@ -44,6 +58,43 @@ static const char config_json[] =
   "]}";
 
 static const char downloads_json[] = "[]";
+
+/* ---------- tiny JSON value lookups (flat objects only) ----------------- */
+
+/* Find `"key"` then the following `true`/`false`; returns dflt if absent. */
+static int
+json_get_bool(const char *s, const char *key, int dflt) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(s, pat);
+    if (!p) return dflt;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return dflt;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (!strncmp(p, "true", 4))  return 1;
+    if (!strncmp(p, "false", 5)) return 0;
+    return dflt;
+}
+
+/* Find `"key":"value"` and copy value into out. */
+static void
+json_get_str(const char *s, const char *key, char *out, size_t sz) {
+    out[0] = '\0';
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(s, pat);
+    if (!p) return;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '"') return;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"' && i + 1 < sz) out[i++] = *p++;
+    out[i] = '\0';
+}
 
 /* ---------- JSON builder ------------------------------------------------ */
 
@@ -156,6 +207,139 @@ queue_asset(struct MHD_Connection *conn, const char *url) {
                         asset->data, asset->size, MHD_RESPMEM_PERSISTENT);
 }
 
+static int
+path_segment_safe(const char *s) {
+    if (!s || !s[0] || strstr(s, "..")) return 0;
+    for (const char *p = s; *p; p++) {
+        int ok = (*p >= 'A' && *p <= 'Z') ||
+                 (*p >= 'a' && *p <= 'z') ||
+                 (*p >= '0' && *p <= '9') ||
+                 *p == '_' || *p == '-' || *p == '.';
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+static void
+record_pkg_diag(const char *url, const char *range, unsigned int status,
+                uint64_t start, uint64_t end, uint64_t total) {
+    pthread_mutex_lock(&g_mutex);
+    g_pkg_hits++;
+    snprintf(g_pkg_diag_json, sizeof(g_pkg_diag_json),
+             "{\"hits\":%lu,\"url\":\"%.220s\",\"range\":\"%.160s\","
+             "\"status\":%u,\"start\":%llu,\"end\":%llu,\"total\":%llu}",
+             g_pkg_hits, url ? url : "", range ? range : "", status,
+             (unsigned long long)start,
+             (unsigned long long)end,
+             (unsigned long long)total);
+    pthread_mutex_unlock(&g_mutex);
+}
+
+/* Serve a downloaded package back to Sony's installer over localhost. This is
+   only for files PatchDL already placed under /data/patchdl/<title>/<pkg>. */
+static enum MHD_Result
+queue_pkg_file(struct MHD_Connection *conn, const char *url) {
+    const char *prefix = "/api/pkg/";
+    const char *p, *slash;
+    char title_id[32], file[160], path[360];
+    size_t len;
+    struct stat st;
+    int fd;
+    const char *range;
+    uint64_t total, start = 0, end = 0, send_size = 0;
+    unsigned int status = MHD_HTTP_OK;
+    char content_range[96];
+    struct MHD_Response *resp;
+    enum MHD_Result ret;
+
+    if (strncmp(url, prefix, strlen(prefix)))
+        return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
+    p = url + strlen(prefix);
+    slash = strchr(p, '/');
+    if (!slash || slash == p || !slash[1])
+        return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
+
+    len = (size_t)(slash - p);
+    if (len >= sizeof(title_id))
+        return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
+    memcpy(title_id, p, len);
+    title_id[len] = '\0';
+
+    len = strlen(slash + 1);
+    if (len >= sizeof(file))
+        return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
+    memcpy(file, slash + 1, len + 1);
+
+    if (!path_segment_safe(title_id) || !path_segment_safe(file))
+        return queue_text(conn, MHD_HTTP_FORBIDDEN, "forbidden");
+
+    snprintf(path, sizeof(path), "%s/%s/%s", PATCHDL_DL_DIR, title_id, file);
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
+    if (fstat(fd, &st) || st.st_size <= 0) {
+        close(fd);
+        return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
+    }
+
+    total = (uint64_t)st.st_size;
+    end = total - 1;
+    send_size = total;
+
+    range = MHD_lookup_connection_value(conn, MHD_HEADER_KIND,
+                                        MHD_HTTP_HEADER_RANGE);
+    if (range && !strncmp(range, "bytes=", 6)) {
+        const char *spec = range + 6;
+        char *dash = strchr(spec, '-');
+        if (!dash || strchr(dash + 1, ',')) {
+            close(fd);
+            return queue_text(conn, MHD_HTTP_RANGE_NOT_SATISFIABLE, "invalid range");
+        }
+
+        if (dash == spec) {
+            uint64_t suffix = strtoull(dash + 1, NULL, 10);
+            if (!suffix) {
+                close(fd);
+                return queue_text(conn, MHD_HTTP_RANGE_NOT_SATISFIABLE, "invalid range");
+            }
+            start = suffix >= total ? 0 : total - suffix;
+        } else {
+            start = strtoull(spec, NULL, 10);
+            if (dash[1])
+                end = strtoull(dash + 1, NULL, 10);
+        }
+
+        if (start >= total || end < start) {
+            close(fd);
+            return queue_text(conn, MHD_HTTP_RANGE_NOT_SATISFIABLE, "range not satisfiable");
+        }
+        if (end >= total) end = total - 1;
+        send_size = end - start + 1;
+        status = 206;
+    }
+    record_pkg_diag(url, range, status, start, end, total);
+
+    resp = MHD_create_response_from_fd_at_offset64(send_size, fd, start);
+    if (!resp) {
+        close(fd);
+        return MHD_NO;
+    }
+    MHD_add_response_header(resp, MHD_HTTP_HEADER_ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+    MHD_add_response_header(resp, MHD_HTTP_HEADER_CACHE_CONTROL, "no-store");
+    MHD_add_response_header(resp, MHD_HTTP_HEADER_CONTENT_TYPE, "application/octet-stream");
+    MHD_add_response_header(resp, MHD_HTTP_HEADER_ACCEPT_RANGES, "bytes");
+    if (status == 206) {
+        snprintf(content_range, sizeof(content_range), "bytes %llu-%llu/%llu",
+                 (unsigned long long)start,
+                 (unsigned long long)end,
+                 (unsigned long long)total);
+        MHD_add_response_header(resp, MHD_HTTP_HEADER_CONTENT_RANGE, content_range);
+    }
+    ret = MHD_queue_response(conn, status, resp);
+    MHD_destroy_response(resp); /* closes fd */
+    return ret;
+}
+
 /* ---------- status JSON ------------------------------------------------- */
 
 static void
@@ -166,8 +350,93 @@ rebuild_status_json(void) {
              "\"dns_guard\":\"Active\","
              "\"resolver\":\"Internal allowlist\","
              "\"free_space_mb\":0,"
-             "\"download_dir\":\"/mnt/usb0/patches\"}",
+             "\"download_dir\":\"/data/patchdl (internal)\"}",
              g_fw.str, g_fw.bin);
+}
+
+/* ---------- config persistence (/data/patchdl/config.json) -------------- */
+
+/* Serialize the current global settings; the fixed source policy + allowlist
+   are appended from config_tail_json. Caller owns the result (queue_json_owned). */
+static char *
+build_config_json(void) {
+    char head[192];
+
+    pthread_mutex_lock(&g_mutex);
+    snprintf(head, sizeof(head),
+             "{\"default_policy\":\"%s\","
+             "\"install_after_download\":%s,"
+             "\"delete_pkg_after_install\":%s,",
+             g_cfg.default_policy[0] ? g_cfg.default_policy : "deny",
+             g_cfg.install_after_download ? "true" : "false",
+             g_cfg.delete_pkg_after_install ? "true" : "false");
+    pthread_mutex_unlock(&g_mutex);
+
+    char *out = malloc(strlen(head) + sizeof(config_tail_json));
+    if (!out) return NULL;
+    strcpy(out, head);
+    strcat(out, config_tail_json);
+    return out;
+}
+
+/* Write global settings + per-title enabled flags. Must NOT be called while
+   holding g_mutex (it takes the lock itself). */
+static void
+save_config(void) {
+    FILE *f;
+
+    mkdir(PATCHDL_DL_DIR, 0777);
+    f = fopen(PATCHDL_CFG_PATH, "w");
+    if (!f) return;
+
+    pthread_mutex_lock(&g_mutex);
+    fprintf(f,
+            "{\n\"default_policy\":\"%s\",\n"
+            "\"install_after_download\":%s,\n"
+            "\"delete_pkg_after_install\":%s,\n\"titles\":{",
+            g_cfg.default_policy[0] ? g_cfg.default_policy : "deny",
+            g_cfg.install_after_download ? "true" : "false",
+            g_cfg.delete_pkg_after_install ? "true" : "false");
+    for (size_t i = 0; i < g_title_count; i++)
+        fprintf(f, "%s\"%s\":%s", i ? "," : "",
+                g_titles[i].title_id, g_titles[i].enabled ? "true" : "false");
+    fprintf(f, "}\n}\n");
+    pthread_mutex_unlock(&g_mutex);
+
+    fclose(f);
+}
+
+/* Load persisted settings over the defaults. Called once at startup, after the
+   scan, while still single-threaded. */
+static void
+load_config(void) {
+    FILE  *f;
+    char   buf[16384];
+    size_t n;
+    char   pol[8];
+
+    f = fopen(PATCHDL_CFG_PATH, "r");
+    if (!f) return;
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    json_get_str(buf, "default_policy", pol, sizeof(pol));
+    if (pol[0]) {
+        strncpy(g_cfg.default_policy, pol, sizeof(g_cfg.default_policy) - 1);
+        g_cfg.default_policy[sizeof(g_cfg.default_policy) - 1] = '\0';
+    }
+    g_cfg.install_after_download =
+        json_get_bool(buf, "install_after_download", g_cfg.install_after_download);
+    g_cfg.delete_pkg_after_install =
+        json_get_bool(buf, "delete_pkg_after_install", g_cfg.delete_pkg_after_install);
+
+    /* per-title overrides live under "titles": { "<id>": true|false, ... } */
+    const char *titles = strstr(buf, "\"titles\"");
+    if (titles)
+        for (size_t i = 0; i < g_title_count; i++)
+            g_titles[i].enabled =
+                json_get_bool(titles, g_titles[i].title_id, g_titles[i].enabled);
 }
 
 /* ---------- titles JSON (built per request under mutex) ----------------- */
@@ -227,13 +496,15 @@ build_titles_json(void) {
             jbuf_append_ver_or_null(&j, t->version_file_uri);
         jbuf_append(&j, ",\"patch_title_id\":");
             jbuf_append_ver_or_null(&j, t->patch_title_id);
-        /* The patch package's title must match the game; a mismatch means a
-           cross-region/title package that must NOT be installed. */
+        jbuf_append(&j, ",\"patch_storage_title_id\":");
+            jbuf_append_ver_or_null(&j, t->patch_storage_title_id);
+        /* This is the target title id parsed from version.xml/manifest_url.
+           CDN storage paths may use another regional/master title id; that is
+           not exposed here and must not block a valid target match. */
         jbuf_appendf(&j, ",\"patch_title_match\":%s",
                      (!t->patch_title_id[0] ||
                       !strncmp(t->patch_title_id, t->title_id, 9)) ? "true" : "false");
-        jbuf_appendf(&j, ",\"enabled\":%s",
-                     t->source_type == PATCHDL_SOURCE_UNKNOWN ? "false" : "true");
+        jbuf_appendf(&j, ",\"enabled\":%s", t->enabled ? "true" : "false");
         jbuf_append(&j, ",\"mode\":");
             jbuf_append_str(&j, title_mode_str(t->source_type));
         jbuf_append(&j, ",\"queued\":false");
@@ -248,6 +519,21 @@ build_titles_json(void) {
 }
 
 /* ---------- verxml background fetch ------------------------------------ */
+
+/* Remove a downloaded patch once the game is at/past that version, i.e. the
+   install completed. Patches stay internal (/data/patchdl) and are cleaned up
+   here at the next scan — not during the async install, which still reads the
+   file. */
+static void
+cleanup_installed_download(const char *title_id, const char *patch_url) {
+    char        dir[256], path[320];
+    const char *base = strrchr(patch_url, '/');
+    base = base ? base + 1 : "patch.pkg";
+    snprintf(dir, sizeof(dir), "/data/patchdl/%s", title_id);
+    snprintf(path, sizeof(path), "%s/%s", dir, base);
+    unlink(path);
+    rmdir(dir);
+}
 
 static void *
 verxml_fetch_thread(void *arg) {
@@ -278,8 +564,15 @@ verxml_fetch_thread(void *arg) {
                 sizeof(t->patch_url) - 1);
         strncpy(t->patch_title_id,     info.compatible_title,
                 sizeof(t->patch_title_id) - 1);
+        strncpy(t->patch_storage_title_id, info.compatible_storage_title,
+                sizeof(t->patch_storage_title_id) - 1);
         t->verxml_done = 1;
+        int up_to_date = (t->installed_version[0] && info.compatible_version[0] &&
+                          strcmp(t->installed_version, info.compatible_version) >= 0);
         pthread_mutex_unlock(&g_mutex);
+
+        if (up_to_date && info.compatible_url[0])
+            cleanup_installed_download(t->title_id, info.compatible_url);
     }
     return NULL;
 }
@@ -290,7 +583,9 @@ verxml_fetch_thread(void *arg) {
 static int
 get_title_action_info(const char *title_id, patchdl_source_t *src,
                       char *patch_url, size_t url_sz,
-                      char *patch_title_id, size_t pt_sz) {
+                      char *patch_title_id, size_t pt_sz,
+                      char *patch_storage_title_id, size_t pst_sz,
+                      char *content_id, size_t ci_sz, int *enabled) {
     int found = 0;
 
     pthread_mutex_lock(&g_mutex);
@@ -301,6 +596,11 @@ get_title_action_info(const char *title_id, patchdl_source_t *src,
             patch_url[url_sz - 1] = '\0';
             strncpy(patch_title_id, g_titles[i].patch_title_id, pt_sz - 1);
             patch_title_id[pt_sz - 1] = '\0';
+            strncpy(patch_storage_title_id, g_titles[i].patch_storage_title_id, pst_sz - 1);
+            patch_storage_title_id[pst_sz - 1] = '\0';
+            strncpy(content_id, g_titles[i].content_id, ci_sz - 1);
+            content_id[ci_sz - 1] = '\0';
+            *enabled = g_titles[i].enabled;
             found = 1;
             break;
         }
@@ -309,7 +609,28 @@ get_title_action_info(const char *title_id, patchdl_source_t *src,
     return found;
 }
 
-#define PATCHDL_DL_DIR "/data/patchdl"
+/* Persist a per-title enable/disable toggle. */
+static enum MHD_Result
+set_title_enabled(struct MHD_Connection *conn, const char *title_id, int en) {
+    int found = 0;
+    char r[64];
+
+    pthread_mutex_lock(&g_mutex);
+    for (size_t i = 0; i < g_title_count; i++) {
+        if (!strcmp(g_titles[i].title_id, title_id)) {
+            g_titles[i].enabled = en;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_mutex);
+
+    if (!found) return queue_text(conn, MHD_HTTP_NOT_FOUND, "unknown title");
+
+    save_config();
+    snprintf(r, sizeof(r), "{\"ok\":true,\"enabled\":%s}", en ? "true" : "false");
+    return queue_json_owned(conn, MHD_HTTP_OK, strdup(r));
+}
 
 /* Local on-disk path a title's patch downloads to / installs from. */
 static void
@@ -322,9 +643,13 @@ title_pkg_path(const char *title_id, const char *patch_url,
 
 static enum MHD_Result
 do_download(struct MHD_Connection *conn, const char *title_id,
-            patchdl_source_t src, const char *patch_url) {
+            patchdl_source_t src, const char *patch_url, int enabled) {
     char        dir[256], dest[320], resp[640];
     long long   bytes = 0;
+
+    if (!enabled)
+        return queue_json(conn, MHD_HTTP_FORBIDDEN,
+                          "{\"ok\":false,\"reason\":\"title_disabled\"}");
 
     if (src == PATCHDL_SOURCE_UNKNOWN)
         return queue_json(conn, MHD_HTTP_FORBIDDEN,
@@ -358,9 +683,14 @@ do_download(struct MHD_Connection *conn, const char *title_id,
 static enum MHD_Result
 do_install(struct MHD_Connection *conn, const char *title_id,
            patchdl_source_t src, const char *patch_url,
-           const char *patch_title_id) {
+           const char *patch_title_id, const char *patch_storage_title_id,
+           const char *content_id, int enabled) {
     char dest[320], msg[256], resp[640];
     int  rc;
+
+    if (!enabled)
+        return queue_json(conn, MHD_HTTP_FORBIDDEN,
+                          "{\"ok\":false,\"reason\":\"title_disabled\"}");
 
     /* Source policy: only genuine installs may be patched in place.
        Shadowmounts are download-only; unknown/preinstall are blocked. */
@@ -372,8 +702,9 @@ do_install(struct MHD_Connection *conn, const char *title_id,
         return queue_json(conn, MHD_HTTP_CONFLICT,
                           "{\"ok\":false,\"reason\":\"no_compatible_patch\"}");
 
-    /* GUARD (app layer): the patch package's title id must match the game.
-       A cross-title/region patch would install as a phantom title. */
+    /* GUARD (app layer): the version.xml target title id must match the game.
+       CDN storage under a different regional/master id is valid and has
+       already been normalized by patchdl_verxml. */
     if (patch_title_id[0] && strncmp(patch_title_id, title_id, 9) != 0) {
         snprintf(resp, sizeof(resp),
                  "{\"ok\":false,\"reason\":\"patch_title_mismatch\","
@@ -384,9 +715,8 @@ do_install(struct MHD_Connection *conn, const char *title_id,
 
     title_pkg_path(title_id, patch_url, dest, sizeof(dest));
 
-    /* GUARD (authoritative): patchdl_install reads the PKG's real title id and
-       refuses if it does not match `title_id`. */
-    rc = patchdl_install_local_pkg(dest, title_id, msg, sizeof(msg));
+    rc = patchdl_install_local_pkg(dest, title_id, patch_storage_title_id,
+                                   content_id, msg, sizeof(msg));
     snprintf(resp, sizeof(resp),
              "{\"ok\":%s,\"rc\":%d,\"message\":\"%s\",\"path\":\"%s\"}",
              rc == 0 ? "true" : "false", rc, msg, dest);
@@ -425,6 +755,9 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
     char             action[24];
     char             patch_url[512] = {0};
     char             patch_title_id[16] = {0};
+    char             patch_storage_title_id[16] = {0};
+    char             content_id[64] = {0};
+    int              enabled = 0;
     patchdl_source_t src = PATCHDL_SOURCE_UNKNOWN;
 
     if (parse_title_action(url, title_id, sizeof(title_id),
@@ -432,35 +765,109 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
         return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
 
     if (!get_title_action_info(title_id, &src, patch_url, sizeof(patch_url),
-                               patch_title_id, sizeof(patch_title_id)))
+                               patch_title_id, sizeof(patch_title_id),
+                               patch_storage_title_id,
+                               sizeof(patch_storage_title_id),
+                               content_id, sizeof(content_id), &enabled))
         return queue_text(conn, MHD_HTTP_NOT_FOUND, "unknown title");
 
+    if (!strcmp(action, "enable"))
+        return set_title_enabled(conn, title_id, 1);
+
+    if (!strcmp(action, "disable"))
+        return set_title_enabled(conn, title_id, 0);
+
     if (!strcmp(action, "download"))
-        return do_download(conn, title_id, src, patch_url);
+        return do_download(conn, title_id, src, patch_url, enabled);
 
     if (!strcmp(action, "check"))
         return queue_json(conn, MHD_HTTP_ACCEPTED,
                           "{\"ok\":true,\"queued\":true,\"action\":\"check\"}");
 
     if (!strcmp(action, "install"))
-        return do_install(conn, title_id, src, patch_url, patch_title_id);
+        return do_install(conn, title_id, src, patch_url, patch_title_id,
+                          patch_storage_title_id, content_id, enabled);
 
     return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
+}
+
+/* ---------- POST body accumulation ------------------------------------- */
+
+/* MHD delivers a POST body across several callback invocations. We stash a
+   growing buffer in con_cls and dispatch once the body is complete. */
+typedef struct {
+    char  *data;
+    size_t len;
+} post_body_t;
+
+static void
+request_completed(void *cls, struct MHD_Connection *conn, void **con_cls,
+                  enum MHD_RequestTerminationCode toe) {
+    (void)cls; (void)conn; (void)toe;
+    post_body_t *pb = *con_cls;
+    if (pb) {
+        free(pb->data);
+        free(pb);
+        *con_cls = NULL;
+    }
+}
+
+static enum MHD_Result
+handle_config_post(struct MHD_Connection *conn, const char *body) {
+    char pol[8];
+
+    json_get_str(body, "default_policy", pol, sizeof(pol));
+
+    pthread_mutex_lock(&g_mutex);
+    if (pol[0]) {
+        strncpy(g_cfg.default_policy, pol, sizeof(g_cfg.default_policy) - 1);
+        g_cfg.default_policy[sizeof(g_cfg.default_policy) - 1] = '\0';
+    }
+    g_cfg.install_after_download =
+        json_get_bool(body, "install_after_download", g_cfg.install_after_download);
+    g_cfg.delete_pkg_after_install =
+        json_get_bool(body, "delete_pkg_after_install", g_cfg.delete_pkg_after_install);
+    pthread_mutex_unlock(&g_mutex);
+
+    save_config();
+    return queue_json_owned(conn, MHD_HTTP_OK, build_config_json());
 }
 
 static enum MHD_Result
 on_request(void *cls, struct MHD_Connection *conn, const char *url,
            const char *method, const char *version, const char *upload_data,
            size_t *upload_data_size, void **con_cls) {
-    (void)cls; (void)version; (void)upload_data; (void)con_cls;
+    (void)cls; (void)version;
 
     if (!strcmp(method, MHD_HTTP_METHOD_OPTIONS))
         return queue_text(conn, MHD_HTTP_NO_CONTENT, "");
 
     if (!strcmp(method, MHD_HTTP_METHOD_POST)) {
-        if (*upload_data_size) { *upload_data_size = 0; return MHD_YES; }
+        post_body_t *pb = *con_cls;
+
+        if (!pb) {                          /* first call: set up the buffer */
+            pb = calloc(1, sizeof(*pb));
+            if (!pb) return MHD_NO;
+            *con_cls = pb;
+            return MHD_YES;
+        }
+
+        if (*upload_data_size) {            /* a body chunk: append it */
+            char *n = realloc(pb->data, pb->len + *upload_data_size + 1);
+            if (n) {
+                memcpy(n + pb->len, upload_data, *upload_data_size);
+                pb->len += *upload_data_size;
+                n[pb->len] = '\0';
+                pb->data = n;
+            }
+            *upload_data_size = 0;
+            return MHD_YES;
+        }
+
+        /* final call: the full body (if any) is in pb->data */
+        const char *body = pb->data ? pb->data : "";
         if (!strcmp(url, "/api/config"))
-            return queue_json(conn, MHD_HTTP_OK, config_json);
+            return handle_config_post(conn, body);
         if (!strncmp(url, "/api/titles/", 12))
             return handle_title_action(conn, url);
         return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
@@ -474,7 +881,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         return queue_json(conn, MHD_HTTP_OK, g_status_json);
 
     if (!strcmp(url, "/api/config"))
-        return queue_json(conn, MHD_HTTP_OK, config_json);
+        return queue_json_owned(conn, MHD_HTTP_OK, build_config_json());
 
     if (!strcmp(url, "/api/titles"))
         return queue_json_owned(conn, MHD_HTTP_OK, build_titles_json());
@@ -494,6 +901,15 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         return queue_json_owned(conn, MHD_HTTP_OK, strdup(r));
     }
 
+    if (!strcmp(url, "/api/apiprobe")) {
+        char p[2048];
+        patchdl_install_api_probe(p, sizeof(p));
+        return queue_json_owned(conn, MHD_HTTP_OK, strdup(p));
+    }
+
+    if (!strcmp(url, "/api/pkgdiag"))
+        return queue_json(conn, MHD_HTTP_OK, g_pkg_diag_json);
+
     if (!strcmp(url, "/api/netcheck")) {
         char diag[1024] = "{\"error\":\"no title with version_file_uri\"}";
         pthread_mutex_lock(&g_mutex);
@@ -506,6 +922,9 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         pthread_mutex_unlock(&g_mutex);
         return queue_json(conn, MHD_HTTP_OK, diag);
     }
+
+    if (!strncmp(url, "/api/pkg/", 9))
+        return queue_pkg_file(conn, url);
 
     return queue_asset(conn, url);
 }
@@ -527,6 +946,12 @@ patchdl_websrv_start(unsigned short port) {
     if (patchdl_scan(&g_titles, &g_title_count))
         g_title_count = 0;
 
+    /* Default per-title policy (unknown sources off), then overlay anything the
+       user previously saved to /data/patchdl/config.json. */
+    for (size_t i = 0; i < g_title_count; i++)
+        g_titles[i].enabled = (g_titles[i].source_type != PATCHDL_SOURCE_UNKNOWN);
+    load_config();
+
     /* Build the diagnostic dump now, while single-threaded — the root-vnode
        swap it performs is unsafe once MHD worker threads are running. */
     g_debug_json = patchdl_scan_debug_json();
@@ -534,6 +959,7 @@ patchdl_websrv_start(unsigned short port) {
     web_daemon = MHD_start_daemon(
         MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_THREAD_PER_CONNECTION,
         port, NULL, NULL, &on_request, NULL,
+        MHD_OPTION_NOTIFY_COMPLETED, request_completed, NULL,
         MHD_OPTION_END);
 
     if (!web_daemon) {

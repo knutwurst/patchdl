@@ -57,8 +57,8 @@ ver_gt(const char *a, const char *b) {
     return strcmp(a, b) > 0;
 }
 
-/* Extract the first PS4/PS5 title id token ([A-Z]{4}[0-9]{5}, e.g. PPSA03098)
-   from a string such as a delta_url. Used to detect cross-title patches. */
+/* Extract the first PS4/PS5 title id token ([A-Z]{4}[0-9]{5}, e.g. PPSA03099)
+   from a string such as nptitleid, manifest_url, or delta_url. */
 static void
 extract_title_id(const char *s, char *out, size_t sz) {
     out[0] = '\0';
@@ -78,8 +78,30 @@ extract_title_id(const char *s, char *out, size_t sz) {
 }
 
 static void
+parse_root_title_id(const char *xml, char *out, size_t sz) {
+    const char *p;
+    const char *tag_end;
+    char nptitleid[64] = {0};
+
+    out[0] = '\0';
+    if (!xml || sz < 10) return;
+
+    p = strstr(xml, "<title_patch");
+    if (!p) return;
+    tag_end = strchr(p, '>');
+    if (!tag_end) return;
+    tag_end++;
+
+    if (!attr_val(p, tag_end, "nptitleid", nptitleid, sizeof(nptitleid)))
+        extract_title_id(nptitleid, out, sz);
+}
+
+static void
 parse_packages(const char *xml, uint32_t fw_bin, patchdl_verinfo_t *out) {
     const char *p = xml;
+    char root_title[16] = {0};
+
+    parse_root_title_id(xml, root_title, sizeof(root_title));
 
     while ((p = strstr(p, "<package "))) {
         const char *tag_end = strchr(p, '>');
@@ -89,12 +111,14 @@ parse_packages(const char *xml, uint32_t fw_bin, patchdl_verinfo_t *out) {
         char ver[16]  = {0};
         char sver[16] = {0};
         char durl[512] = {0};
+        char murl[512] = {0};
 
         /* PS5 version.xml uses content_ver; PS4 uses version. */
         if (attr_val(p, tag_end, "content_ver", ver, sizeof(ver)))
             attr_val(p, tag_end, "version", ver, sizeof(ver));
         attr_val(p, tag_end, "system_ver", sver, sizeof(sver));
         attr_val(p, tag_end, "delta_url", durl, sizeof(durl));
+        attr_val(p, tag_end, "manifest_url", murl, sizeof(murl));
 
         if (ver[0] && sver[0]) {
             uint32_t pkg_sver = parse_hex(sver);
@@ -114,8 +138,18 @@ parse_packages(const char *xml, uint32_t fw_bin, patchdl_verinfo_t *out) {
                             sizeof(out->compatible_version) - 1);
                     strncpy(out->compatible_url, durl,
                             sizeof(out->compatible_url) - 1);
-                    extract_title_id(durl, out->compatible_title,
-                                     sizeof(out->compatible_title));
+                    extract_title_id(durl, out->compatible_storage_title,
+                                     sizeof(out->compatible_storage_title));
+                    if (root_title[0]) {
+                        strncpy(out->compatible_title, root_title,
+                                sizeof(out->compatible_title) - 1);
+                    } else {
+                        extract_title_id(murl, out->compatible_title,
+                                         sizeof(out->compatible_title));
+                        if (!out->compatible_title[0])
+                            extract_title_id(durl, out->compatible_title,
+                                             sizeof(out->compatible_title));
+                    }
                 }
             }
         }

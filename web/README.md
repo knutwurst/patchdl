@@ -18,6 +18,9 @@ GET  /api/titles
 GET  /api/downloads
 POST /api/titles/:title_id/check
 POST /api/titles/:title_id/download
+POST /api/titles/:title_id/install
+POST /api/titles/:title_id/enable
+POST /api/titles/:title_id/disable
 ```
 
 ## Policy Model
@@ -27,9 +30,9 @@ The UI assumes deny-by-default behavior:
 ```json
 {
   "default_policy": "deny",
-  "download_dir": "/mnt/usb0/patches",
+  "download_dir": "/data/patchdl (internal)",
   "install_after_download": false,
-  "delete_pkg_after_install": false,
+  "delete_pkg_after_install": true,
   "source_policy": {
     "official": { "allow_check": true, "allow_download": true, "allow_install": true },
     "external": { "allow_check": true, "allow_download": true, "allow_install": true },

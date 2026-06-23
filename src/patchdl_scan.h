@@ -24,8 +24,10 @@ typedef struct {
     char             latest_version[16];
     char             latest_required_fw[16];
     char             patch_url[512];   /* delta_url of the compatible patch */
-    char             patch_title_id[16]; /* title id embedded in patch_url */
+    char             patch_title_id[16]; /* target title id from version.xml */
+    char             patch_storage_title_id[16]; /* title id embedded in delta_url */
     int              verxml_done;
+    int              enabled;          /* user policy, persisted in config.json */
 } patchdl_title_t;
 
 int         patchdl_scan(patchdl_title_t **titles_out, size_t *count_out);

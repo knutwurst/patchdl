@@ -25,7 +25,7 @@ by Knutwurst
 ## Safety model
 
 Deny-by-default. A patch is installed only for a genuine install, and only when
-the package's title id matches the installed game:
+the patch metadata targets the installed game:
 
 | Source                | Check | Download | Install |
 |-----------------------|-------|----------|---------|
@@ -33,11 +33,13 @@ the package's title id matches the installed game:
 | shadowmount           | yes   | yes      | no      |
 | preinstall / unknown  | yes   | no       | no      |
 
-Two independent guards stop the wrong package being installed: the patch's title
-id (read from its download URL) must match the game, and just before install the
-real title id is read back from the package
-(`sceAppInstUtilGetTitleIdFromPkg`) and checked again. A cross-region or
-cross-title package is refused instead of installed as a phantom title.
+Two independent guards stop the wrong target being installed: the patch target
+id (read from `version.xml` / `manifest_url`) must match the installed game, and
+the install call receives the installed game's content id from app.db. Sony may
+store the actual patch bytes under a regional/master title id that differs from
+the target; that storage id is accepted only when `version.xml` targets the
+installed title. A true target-title mismatch is refused instead of installed as
+a phantom title.
 
 ## Build
 
@@ -69,9 +71,13 @@ http://<console-ip>:12880/
 
 ## Status
 
-0.0.1, early. Title scan, version resolution, firmware-compatibility filtering,
-download, and install work and have been verified on firmware 11.60. Open items:
-the web UI marks a title "Installing…" but reads progress from the PS5's own
-notifications rather than a percentage; config persistence and a download queue
-are not built yet; disc-based games need the disc inserted for their patch to
-apply (a normal Sony requirement).
+0.0.2, early. Title scan, source classification, version resolution,
+firmware-compatibility filtering, download, and install work and have been
+verified on firmware 11.60. Patches download internally to `/data/patchdl` and
+are removed once the install has applied. Each title has a single action button
+(Download then Install, or Update when "install after download" is on). Open
+items: the web UI marks a title "Installing…" but reads progress from the PS5's
+own notifications rather than a percentage; a download queue is not built yet;
+disc-based games need the disc inserted for their patch to apply (a normal Sony
+requirement). Settings (global policy and the per-game toggle) persist to
+`/data/patchdl/config.json` and survive a restart.

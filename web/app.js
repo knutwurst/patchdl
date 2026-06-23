@@ -40,13 +40,13 @@ const fallback = {
     dns_guard: "Active",
     resolver: "Internal allowlist",
     free_space_mb: 64218,
-    download_dir: "/mnt/usb0/patches",
+    download_dir: "/data/patchdl (internal)",
   },
   config: {
     default_policy: "deny",
-    download_dir: "/mnt/usb0/patches",
+    download_dir: "/data/patchdl (internal)",
     install_after_download: false,
-    delete_pkg_after_install: false,
+    delete_pkg_after_install: true,
     source_policy: {
       official: { allow_check: true, allow_download: true, allow_install: true },
       external: { allow_check: true, allow_download: true, allow_install: true },
@@ -293,7 +293,7 @@ function renderGames() {
 function gameCategory(game) {
   if (game.installing) return "updatable"; // keep visible while the patch installs
   if (game.status === "checking") return "checking";
-  if (game.patch_title_match === false) return "blocked"; // cross-region/title patch
+  if (game.patch_title_match === false) return "blocked"; // target-title mismatch
   if (!sourcePolicy(game).allow_install) return "blocked";
   if (game.status === "available") return "updatable";
   if (game.status === "incompatible_fw") return "needsfw";
@@ -322,7 +322,9 @@ function createGameCard(game) {
   title.className = "game-title";
   const installBlocked = isInstallBlocked(game);
   title.innerHTML = `
-    <div class="cover">${initials(game.name)}</div>
+    <div class="lead">
+      <div class="cover">${initials(game.name)}</div>
+    </div>
     <div>
       <h3>${escapeHtml(game.name)}</h3>
       <div class="subline">
@@ -333,11 +335,33 @@ function createGameCard(game) {
         ${statusPill(game)}
         ${sourcePill(game)}
         ${installBlocked ? `<span class="pill blocked">Install blocked</span>` : `<span class="pill ok">Install allowed</span>`}
-        <span class="pill">${game.enabled ? "Enabled" : "Off"}</span>
       </div>
       <div class="source-path">${escapeHtml(sourceDetail(game))}</div>
     </div>
   `;
+
+  // Per-game enable/disable toggle, grouped under the game icon on the left
+  // (only for sources that can actually be patched).
+  if (sourcePolicy(game).allow_install) {
+    const lead = title.querySelector(".lead");
+    const toggle = document.createElement("label");
+    toggle.className = "toggle";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = game.enabled !== false;
+    cb.setAttribute("aria-label", `Enable updates for ${game.name}`);
+    const track = document.createElement("span");
+    track.className = "track";
+    const lbl = document.createElement("span");
+    lbl.className = "label";
+    lbl.textContent = cb.checked ? "On" : "Off";
+    cb.addEventListener("change", () => {
+      lbl.textContent = cb.checked ? "On" : "Off";
+      updateGame(game.title_id, { enabled: cb.checked, mode: cb.checked ? "latest_compatible" : "disabled" });
+    });
+    toggle.append(cb, track, lbl);
+    lead.appendChild(toggle);
+  }
 
   const versions = document.createElement("div");
   versions.className = "version-grid";
@@ -350,56 +374,23 @@ function createGameCard(game) {
   const controls = document.createElement("div");
   controls.className = "controls";
 
-  const controlRow = document.createElement("div");
-  controlRow.className = "control-row";
-
-  const mode = document.createElement("select");
-  mode.title = "Update mode";
-  [
-    ["disabled", "Disabled"],
-    ["download_only", "Download only"],
-    ["latest_compatible", "Latest compatible"],
-    ["pin", "Pin version"],
-    ["check_only", "Check only"],
-  ].forEach(([value, label]) => {
-    const option = document.createElement("option");
-    option.value = value;
-    option.textContent = label;
-    option.selected = (game.mode || "disabled") === value;
-    mode.appendChild(option);
-  });
-  mode.addEventListener("change", () => updateGame(game.title_id, { mode: mode.value, enabled: mode.value !== "disabled" }));
-
-  const pin = document.createElement("input");
-  pin.title = "Maximum content version";
-  pin.placeholder = "max ver";
-  pin.value = game.max_content_ver || "";
-  pin.addEventListener("change", () => updateGame(game.title_id, { max_content_ver: pin.value.trim() }));
-
-  controlRow.append(mode, pin);
-
   const actions = document.createElement("div");
   actions.className = "actions-row";
-  actions.innerHTML = `
-    <button class="row-button" data-action="check">
-      <svg><use href="#icon-refresh"></use></svg>
-      Check
-    </button>
-    <button class="row-button is-primary" data-action="download" ${!isDownloadAllowed(game) ? "disabled" : ""} title="${escapeHtml(downloadTitle(game))}">
-      <svg><use href="#icon-download"></use></svg>
-      Download
-    </button>
-    <button class="row-button" data-action="install" ${(!isInstallAllowed(game) || game.installing) ? "disabled" : ""} title="${escapeHtml(installTitle(game))}">
-      <svg><use href="#icon-download"></use></svg>
-      ${game.installing ? "Installing…" : "Install"}
-    </button>
-  `;
+  const act = rowAction(game);
+  if (act) {
+    const btn = document.createElement("button");
+    btn.className = "row-button is-primary";
+    btn.innerHTML = `<svg><use href="#icon-download"></use></svg> ${escapeHtml(act.label)}`;
+    btn.title = escapeHtml(act.hint || act.label);
+    if (act.disabled || !act.action) {
+      btn.disabled = true;
+    } else {
+      btn.addEventListener("click", () => runTitleAction(game.title_id, act.action));
+    }
+    actions.appendChild(btn);
+  }
 
-  actions.querySelectorAll("button").forEach((button) => {
-    button.addEventListener("click", () => runTitleAction(game.title_id, button.dataset.action));
-  });
-
-  controls.append(controlRow, actions);
+  controls.append(actions);
   card.append(title, versions, controls);
   return card;
 }
@@ -413,15 +404,17 @@ function versionBox(label, value) {
   `;
 }
 
+// Status pill = update state only (version/firmware/target title). The source type
+// has its own pill, so this one never repeats "Shadowmount" etc.
 function statusPill(game) {
   if (game.installing) return `<span class="pill warn">Installing…</span>`;
-  const cat = gameCategory(game);
-  if (cat === "checking") return `<span class="pill">Checking…</span>`;
+  if (game.status === "checking") return `<span class="pill">Checking…</span>`;
   if (game.queued || game.status === "queued") return `<span class="pill warn">In queue</span>`;
-  if (cat === "blocked") return `<span class="pill blocked">${escapeHtml(blockedLabel(game))}</span>`;
-  if (cat === "updatable") return `<span class="pill ok">Update available</span>`;
-  if (cat === "needsfw") return `<span class="pill warn">Needs FW ${escapeHtml(game.latest_required_fw || "")}</span>`;
-  return `<span class="pill">Up to date</span>`;
+  if (game.patch_title_match === false) return `<span class="pill blocked">Title mismatch</span>`;
+  if (game.status === "available") return `<span class="pill ok">Update available</span>`;
+  if (game.status === "incompatible_fw") return `<span class="pill warn">Needs FW ${escapeHtml(game.latest_required_fw || "")}</span>`;
+  if (game.status === "up_to_date") return `<span class="pill">Up to date</span>`;
+  return `<span class="pill">No patch info</span>`;
 }
 
 function sourcePill(game) {
@@ -443,15 +436,6 @@ function sourceDetail(game) {
   if (src === "external") return `External: ${game.source_path || "external app metadata"}`;
   if (src === "official") return game.source_path || "Official installation";
   return "Source could not be identified";
-}
-
-function blockedLabel(game) {
-  if (game.patch_title_match === false) return "Region mismatch";
-  const src = sourceType(game);
-  if (src === "shadowmount") return "Shadowmount";
-  if (src === "unknown") return "Preinstall";
-  if (!game.compatible_version) return "FW blocked";
-  return "Blocked";
 }
 
 function renderQueue() {
@@ -520,66 +504,78 @@ async function saveConfig() {
   renderSettings();
 }
 
+// One per-row action button. Returns null when there is nothing to do.
+//   install_after_download ON  -> "Update" (download + install in one go)
+//   install_after_download OFF -> "Download", then "Install" once downloaded
+//   download-only source       -> "Download" (no install step)
+function rowAction(game) {
+  if (game.installing) return { label: "Installing…", disabled: true };
+  if (game.downloading) return { label: "Downloading…", disabled: true };
+  if (game.patch_title_match === false) return null;     // target-title mismatch
+  if (game.status !== "available") return null;          // nothing newer & compatible
+  if (!isInstallAllowed(game)) return null;              // not a patchable source (e.g. shadowmount)
+  if (state.config.install_after_download)
+    return { label: "Update", action: "update", hint: "Download and install the update." };
+  return game.downloaded
+    ? { label: "Install", action: "install", hint: "Install the downloaded patch (modifies the game)." }
+    : { label: "Download", action: "download", hint: "Download the patch internally." };
+}
+
+async function doDownload(game) {
+  game.downloading = true;
+  renderGames();
+  let r;
+  try {
+    r = await postJson(API.action(game.title_id, "download"), {});
+  } catch (error) {
+    game.downloading = false;
+    const why = reasonText(error);
+    state.logs.push(`[${timeNow()}] download ${game.title_id} blocked: ${why}`);
+    showToast(`${game.name}: ${why}`);
+    renderGames();
+    renderLogs();
+    return false;
+  }
+  game.downloading = false;
+  game.downloaded = true;
+  const mb = r && r.bytes ? (r.bytes / (1024 * 1024)).toFixed(1) : "?";
+  state.logs.push(`[${timeNow()}] Downloaded ${game.title_id} ${game.compatible_version} (${mb} MB, internal)`);
+  showToast(`${game.name}: downloaded ${mb} MB.`);
+  renderGames();
+  renderLogs();
+  return true;
+}
+
+async function doInstall(game) {
+  game.installing = true;
+  renderGames();
+  try {
+    await postJson(API.action(game.title_id, "install"), {});
+  } catch (error) {
+    game.installing = false;
+    const why = reasonText(error);
+    state.logs.push(`[${timeNow()}] install ${game.title_id} blocked: ${why}`);
+    showToast(`${game.name}: ${why}`);
+    renderGames();
+    renderLogs();
+    return false;
+  }
+  // rc=0 = accepted; keep "Installing…" (the PS5 applies it in the background;
+  // it clears on the next refresh once the version updates).
+  state.logs.push(`[${timeNow()}] Install started for ${game.title_id} ${game.compatible_version} — running in PS5 background`);
+  showToast(`${game.name}: installing update — progress shows in your PS5 notifications.`);
+  renderGames();
+  renderLogs();
+  return true;
+}
+
 async function runTitleAction(titleId, action) {
   const game = state.titles.find((item) => item.title_id === titleId);
   if (!game) return;
 
-  if (action === "download" && !isDownloadAllowed(game)) {
-    showToast(downloadTitle(game));
-    return;
-  }
-  if (action === "install" && !isInstallAllowed(game)) {
-    showToast(installTitle(game));
-    return;
-  }
-
-  if (action === "download" || action === "install") {
-    showToast(action === "download"
-      ? `Downloading ${game.title_id} ${game.compatible_version}...`
-      : `Installing ${game.title_id} ${game.compatible_version}...`);
-  }
-
-  let result = null;
-  try {
-    result = await postJson(API.action(titleId, action), {});
-  } catch (error) {
-    const why = reasonText(error);
-    state.logs.push(`[${timeNow()}] ${action} ${game.title_id} blocked: ${why}`);
-    showToast(`${game.title_id}: ${why}`);
-    renderGames();
-    renderLogs();
-    return;
-  }
-
-  if (action === "download") {
-    const mb = result && result.bytes ? (result.bytes / (1024 * 1024)).toFixed(1) : "?";
-    game.queued = true;
-    if (!state.downloads.some((item) => item.title_id === titleId)) {
-      state.downloads.push({
-        title_id: game.title_id,
-        name: game.name,
-        version: game.compatible_version,
-        progress: 100,
-        detail: result && result.install_allowed ? "Downloaded - ready to install" : "Downloaded (install blocked)",
-      });
-    }
-    state.logs.push(`[${timeNow()}] Downloaded ${game.title_id} ${game.compatible_version} (${mb} MB) -> ${result ? result.path : "?"}`);
-    showToast(`${game.title_id}: downloaded ${mb} MB.`);
-  } else if (action === "install") {
-    // rc=0 means the Sony installer accepted the job; it now runs in the PS5
-    // background. Mark the card so it's clearly visible the patch is installing.
-    game.installing = true;
-    game.status = "installing";
-    state.logs.push(`[${timeNow()}] Install started for ${game.title_id} ${game.compatible_version} — running in PS5 background`);
-    showToast(`${game.name}: installing update — progress shows in your PS5 notifications.`);
-  } else {
-    state.logs.push(`[${timeNow()}] Check requested for ${game.title_id}`);
-    showToast(`${game.title_id} check queued.`);
-  }
-
-  renderGames();
-  renderQueue();
-  renderLogs();
+  if (action === "download") await doDownload(game);
+  else if (action === "install") await doInstall(game);
+  else if (action === "update") { if (await doDownload(game)) await doInstall(game); }
 }
 
 function updateGame(titleId, patch) {
@@ -592,9 +588,18 @@ function updateGame(titleId, patch) {
   }
   Object.assign(game, patch);
   if (patch.mode === "disabled") game.enabled = false;
-  state.logs.push(`[${timeNow()}] Policy updated for ${titleId}`);
   renderGames();
-  renderLogs();
+
+  // Persist the toggle on the PS5 (survives refresh and payload restart).
+  const wantEnabled = game.enabled !== false;
+  postJson(API.action(titleId, wantEnabled ? "enable" : "disable"), {})
+    .then(() => {
+      state.logs.push(`[${timeNow()}] Saved: ${titleId} ${wantEnabled ? "enabled" : "disabled"}`);
+      renderLogs();
+    })
+    .catch(() => {
+      showToast(`${titleId}: could not save toggle (API not reachable).`);
+    });
 }
 
 function isDownloadAllowed(game) {
@@ -614,7 +619,7 @@ function isInstallAllowed(game) {
   );
 }
 function installTitle(game) {
-  if (game.patch_title_match === false) return "Patch is for a different title/region — install blocked.";
+  if (game.patch_title_match === false) return "Patch metadata targets a different title - install blocked.";
   if (isInstallBlocked(game)) return "Install blocked for this source.";
   if (!game.compatible_version) return "No compatible update to install.";
   return "Install the downloaded patch (modifies the game).";
@@ -655,7 +660,7 @@ async function postJson(url, body) {
 }
 
 const REASON_TEXT = {
-  patch_title_mismatch: "Patch is for a different title/region — install blocked.",
+  patch_title_mismatch: "Patch metadata targets a different title - install blocked.",
   install_not_allowed_for_source: "Install blocked for this source.",
   source_unknown: "Source unknown — blocked.",
   no_compatible_patch: "No compatible patch available.",

@@ -229,20 +229,37 @@ is_game_title(const char *title_id) {
 
 /* ---------- directory scanner ------------------------------------------- */
 
+/* Authoritative shadowmount test: ShadowMountPlus routes its images through
+   /mnt/shadowmnt (a pfs from /dev/lvdN there, then a nullfs onto the app dir),
+   so a title whose mount table references /mnt/shadowmnt is a shadowmount. The
+   on-disk mount.lnk marker is unreliable across reboots/remounts; the live
+   mount table is not. */
+static int
+mount_is_shadow(const char *title_id, const struct statfs *mounts, int nmounts) {
+    for (int i = 0; i < nmounts; i++) {
+        const char *from = mounts[i].f_mntfromname;
+        const char *on   = mounts[i].f_mntonname;
+        if ((strstr(from, "/mnt/shadowmnt") || strstr(on, "/mnt/shadowmnt")) &&
+            (strstr(from, title_id) || strstr(on, title_id)))
+            return 1;
+    }
+    return 0;
+}
+
 /*
- * Distinguish genuine installs from ShadowMountPlus mounts by on-disk layout
- * under /user/app/<TID>/ (verified on fw 11.60):
- *   - mount.lnk / mount_img.lnk + full sce_sys/  -> ShadowMountPlus mount
- *   - app.pkg (no mount.lnk)                     -> genuine install; app.json
- *       with CDN piece URLs means a not-downloaded preinstall stub, local
- *       URLs mean a real install
- *   - app.json with "fake":true                  -> homebrew fake (skip)
+ * Classify each /user/app/<TID> (verified on fw 11.60):
+ *   - mount table references /mnt/shadowmnt for the title -> ShadowMountPlus
+ *     mount (authoritative; mount.lnk is only a fallback hint)
+ *   - app.pkg (no shadow mount) -> genuine install; app.json with CDN piece
+ *     URLs means a not-downloaded preinstall stub, local URLs a real install
+ *   - app.json with "fake":true -> homebrew fake (skip)
  */
 static int
-scan_one(const char *base, const char *name, patchdl_title_t *t) {
+scan_one(const char *base, const char *name, patchdl_title_t *t,
+         const struct statfs *mounts, int nmounts) {
     char dir[PATH_MAX];
     char appjson[4096];
-    int  has_mountlnk, has_app_pkg, has_paramjson, is_fake = 0, is_cdn = 0;
+    int  has_mountlnk, has_app_pkg, has_paramjson, is_shadow, is_fake = 0, is_cdn = 0;
 
     snprintf(dir, sizeof(dir), "%s/%s", base, name);
     memset(t, 0, sizeof(*t));
@@ -252,6 +269,7 @@ scan_one(const char *base, const char *name, patchdl_title_t *t) {
     if (!is_game_title(t->title_id))
         return -1;
 
+    is_shadow     = mount_is_shadow(t->title_id, mounts, nmounts);
     has_mountlnk  = path_exists(dir, "mount.lnk") ||
                     path_exists(dir, "mount_img.lnk");
     has_app_pkg   = path_exists(dir, "app.pkg");
@@ -266,19 +284,18 @@ scan_one(const char *base, const char *name, patchdl_title_t *t) {
     if (is_fake)
         return -1;
 
-    if (has_mountlnk) {
-        /* metadata lives in the mounted sce_sys (param.json, or param.sfo
-           for PS4 titles) */
-        if (try_param_json(dir, t))
+    /* app.pkg is the on-disk package of a genuine install; ShadowMountPlus
+       titles never have it (they have mounted/leftover sce_sys content). So
+       app.pkg is the reliable genuine-vs-shadow discriminator — independent of
+       whether the shadow image is currently mounted. */
+    if (has_app_pkg) {
+        t->source_type = is_cdn ? PATCHDL_SOURCE_UNKNOWN  /* CDN pkg = preinstall */
+                                : PATCHDL_SOURCE_OFFICIAL;
+    } else if (is_shadow || has_mountlnk || has_paramjson ||
+               path_exists(dir, "sce_sys/param.sfo")) {
+        if (try_param_json(dir, t)) /* metadata from the mounted sce_sys */
             try_param_sfo(dir, t);
         t->source_type = PATCHDL_SOURCE_SHADOWMOUNT;
-    } else if (has_app_pkg) {
-        t->source_type = is_cdn ? PATCHDL_SOURCE_UNKNOWN
-                                : PATCHDL_SOURCE_OFFICIAL;
-    } else if (has_paramjson || path_exists(dir, "sce_sys/param.sfo")) {
-        if (try_param_json(dir, t)) /* genuine game currently mounted */
-            try_param_sfo(dir, t);
-        t->source_type = PATCHDL_SOURCE_OFFICIAL;
     } else {
         return -1; /* empty / leftover directory */
     }
@@ -300,7 +317,8 @@ already_seen(const patchdl_title_t *arr, size_t cnt, const char *title_id) {
 }
 
 static void
-scan_base(const char *base, patchdl_title_t *arr, size_t *cnt, size_t cap) {
+scan_base(const char *base, patchdl_title_t *arr, size_t *cnt, size_t cap,
+          const struct statfs *mounts, int nmounts) {
     DIR           *d;
     struct dirent *de;
 
@@ -310,7 +328,7 @@ scan_base(const char *base, patchdl_title_t *arr, size_t *cnt, size_t cap) {
     while ((de = readdir(d))) {
         if (de->d_name[0] == '.') continue;
         if (*cnt >= cap) break;
-        if (scan_one(base, de->d_name, &arr[*cnt]) != 0)
+        if (scan_one(base, de->d_name, &arr[*cnt], mounts, nmounts) != 0)
             continue;
         if (already_seen(arr, *cnt, arr[*cnt].title_id))
             continue; /* dedupe a title already found in an earlier base */
@@ -369,12 +387,20 @@ patchdl_scan(patchdl_title_t **titles_out, size_t *count_out) {
     intptr_t saved_root = 0, root_vnode;
     int using_vswap = 0;
 
+    struct statfs *mounts = NULL;
+    int            nmounts;
+
     arr = calloc(MAX_TITLES, sizeof(*arr));
     if (!arr) return -1;
 
     /* Elevate so privileged paths (the app.db under /system_data) are
        readable; same authid ftpsrv uses. No-op without kernel R/W. */
     kernel_set_ucred_authid(pid, 0x4801000000000013L);
+
+    /* Global mount table for shadowmount detection. getmntinfo's buffer is
+       libc-managed — must NOT be freed. */
+    nmounts = getmntinfo(&mounts, MNT_NOWAIT);
+    if (nmounts < 0) { nmounts = 0; mounts = NULL; }
 
     root_vnode = kernel_get_root_vnode();
     if (root_vnode) {
@@ -384,7 +410,7 @@ patchdl_scan(patchdl_title_t **titles_out, size_t *count_out) {
     }
 
     for (int i = 0; SCAN_DIRS[i]; i++)
-        scan_base(SCAN_DIRS[i], arr, &cnt, MAX_TITLES);
+        scan_base(SCAN_DIRS[i], arr, &cnt, MAX_TITLES, mounts, nmounts);
 
     merge_appdb(arr, cnt);
 

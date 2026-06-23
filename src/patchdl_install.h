@@ -13,13 +13,21 @@
  * (official) titles and obtain explicit user intent before calling.
  */
 /* `expected_title_id` is the title id of the installed game the patch is for.
-   The PKG's own title id is read and must match, else the install is refused
-   (prevents a cross-region/cross-title package being installed as a new
-   phantom title). */
+   `storage_title_id` is the title id embedded in the delta_url storage path.
+   `target_content_id` is the installed game's content id from app.db; when
+   present it is passed to InstallByPackage so Sony's installer has the target
+   metadata even for region-shared/master-storage patch bytes. */
 int patchdl_install_local_pkg(const char *local_path,
                               const char *expected_title_id,
+                              const char *storage_title_id,
+                              const char *target_content_id,
                               char *msg, size_t msg_sz);
 
 /* Verify the AppInstUtil backend can be loaded + resolved + initialized,
    WITHOUT performing any install. Returns 0 if ready. Safe to call. */
 int patchdl_install_backend_check(char *msg, size_t msg_sz);
+
+/* Read-only feasibility probe: resolve (dlsym, never call) a list of candidate
+   AppInstUtil/Bgft patch-install symbols and report which exist on this
+   firmware. Writes a JSON object into `out`. No install, no side effects. */
+int patchdl_install_api_probe(char *out, size_t out_sz);
