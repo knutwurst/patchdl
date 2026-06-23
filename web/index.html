@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PatchDL</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <svg class="icon-sprite" aria-hidden="true">
+      <symbol id="icon-shield" viewBox="0 0 24 24">
+        <path d="M12 3l7 3v5c0 5-3 8-7 10-4-2-7-5-7-10V6l7-3z" />
+        <path d="M9 12l2 2 4-5" />
+      </symbol>
+      <symbol id="icon-download" viewBox="0 0 24 24">
+        <path d="M12 3v11" />
+        <path d="M7 10l5 5 5-5" />
+        <path d="M5 20h14" />
+      </symbol>
+      <symbol id="icon-refresh" viewBox="0 0 24 24">
+        <path d="M20 6v6h-6" />
+        <path d="M4 18v-6h6" />
+        <path d="M19 12A7 7 0 0 0 7 7" />
+        <path d="M5 12a7 7 0 0 0 12 5" />
+      </symbol>
+      <symbol id="icon-settings" viewBox="0 0 24 24">
+        <path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" />
+        <path d="M4 12h2M18 12h2M12 4v2M12 18v2M6.5 6.5 8 8M16 16l1.5 1.5M17.5 6.5 16 8M8 16l-1.5 1.5" />
+      </symbol>
+      <symbol id="icon-search" viewBox="0 0 24 24">
+        <path d="M10.5 18a7.5 7.5 0 1 1 0-15 7.5 7.5 0 0 1 0 15z" />
+        <path d="M16 16l5 5" />
+      </symbol>
+      <symbol id="icon-save" viewBox="0 0 24 24">
+        <path d="M5 4h12l2 2v14H5V4z" />
+        <path d="M8 4v6h8V4" />
+        <path d="M8 20v-6h8v6" />
+      </symbol>
+      <symbol id="icon-pause" viewBox="0 0 24 24">
+        <path d="M8 5v14" />
+        <path d="M16 5v14" />
+      </symbol>
+      <symbol id="icon-log" viewBox="0 0 24 24">
+        <path d="M7 4h10l3 3v13H7V4z" />
+        <path d="M17 4v4h4" />
+        <path d="M10 12h7M10 16h5" />
+      </symbol>
+    </svg>
+
+    <div class="app-shell">
+      <aside class="rail" aria-label="Navigation">
+        <div class="brand">
+          <div class="brand-mark">PD</div>
+          <div>
+            <strong>PatchDL</strong>
+            <span>PS5 Patch Control</span>
+          </div>
+        </div>
+
+        <nav class="nav-list">
+          <a class="nav-link is-active" href="#games">
+            <svg><use href="#icon-download"></use></svg>
+            Spiele
+          </a>
+          <a class="nav-link" href="#downloads">
+            <svg><use href="#icon-refresh"></use></svg>
+            Queue
+          </a>
+          <a class="nav-link" href="#settings">
+            <svg><use href="#icon-settings"></use></svg>
+            Settings
+          </a>
+          <a class="nav-link" href="#logs">
+            <svg><use href="#icon-log"></use></svg>
+            Logs
+          </a>
+        </nav>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Standalone ELF Web UI</p>
+            <h1>Spielupdates kontrolliert laden</h1>
+          </div>
+          <div class="topbar-actions">
+            <button class="icon-button" id="refreshBtn" title="Status und Spiele neu pruefen">
+              <svg><use href="#icon-refresh"></use></svg>
+            </button>
+            <button class="primary-button" id="saveBtn">
+              <svg><use href="#icon-save"></use></svg>
+              Speichern
+            </button>
+          </div>
+        </header>
+
+        <section class="status-strip" aria-label="Systemstatus">
+          <article class="metric">
+            <span>Firmware</span>
+            <strong id="firmwareValue">--</strong>
+            <em id="firmwareBuild">Systemversion</em>
+          </article>
+          <article class="metric">
+            <span>DNS Guard</span>
+            <strong id="dnsValue">--</strong>
+            <em>Sony blockiert per nanoDNS</em>
+          </article>
+          <article class="metric">
+            <span>CDN Zugriff</span>
+            <strong id="resolverValue">--</strong>
+            <em>Nur PatchDL Resolver</em>
+          </article>
+          <article class="metric">
+            <span>Speicher</span>
+            <strong id="spaceValue">--</strong>
+            <em id="downloadDirValue">Download Ziel</em>
+          </article>
+        </section>
+
+        <section class="toolbar" id="games">
+          <div class="search-box">
+            <svg><use href="#icon-search"></use></svg>
+            <input id="searchInput" type="search" placeholder="Titel, Title ID oder Content ID suchen" />
+          </div>
+
+          <div class="segmented" role="tablist" aria-label="Filter">
+            <button class="is-selected" data-filter="all">Alle</button>
+            <button data-filter="enabled">Aktiv</button>
+            <button data-filter="available">Updates</button>
+            <button data-filter="blocked">Blockiert</button>
+            <button data-filter="queued">Queue</button>
+          </div>
+        </section>
+
+        <section class="game-grid" id="gameGrid" aria-live="polite"></section>
+
+        <section class="split-band">
+          <div class="panel" id="downloads">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Downloads</p>
+                <h2>Aktive Queue</h2>
+              </div>
+              <button class="ghost-button" id="pauseAllBtn">
+                <svg><use href="#icon-pause"></use></svg>
+                Pause
+              </button>
+            </div>
+            <div class="queue-list" id="queueList"></div>
+          </div>
+
+          <div class="panel" id="settings">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Policy</p>
+                <h2>Update Regeln</h2>
+              </div>
+            </div>
+
+            <div class="settings-grid">
+              <label class="field">
+                <span>Default Policy</span>
+                <select id="defaultPolicy">
+                  <option value="deny">Deny by default</option>
+                  <option value="allow">Allow by default</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Download Ordner</span>
+                <input id="downloadDir" type="text" spellcheck="false" />
+              </label>
+              <label class="switch-row">
+                <input id="installAfterDownload" type="checkbox" />
+                <span>
+                  <strong>Nach Download installieren</strong>
+                  <em>Globaler Default, pro Spiel ueberschreibbar</em>
+                </span>
+              </label>
+              <label class="switch-row">
+                <input id="deleteAfterInstall" type="checkbox" />
+                <span>
+                  <strong>PKG nach Installation loeschen</strong>
+                  <em>Nur wenn Installation erfolgreich war</em>
+                </span>
+              </label>
+            </div>
+
+            <div class="allowlist">
+              <span>Interne CDN Allowlist</span>
+              <div id="allowlistHosts"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="log-panel" id="logs">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Runtime</p>
+              <h2>Letzte Ereignisse</h2>
+            </div>
+          </div>
+          <pre id="logOutput" tabindex="0"></pre>
+        </section>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="app.js"></script>
+  </body>
+</html>
