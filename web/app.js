@@ -6,6 +6,33 @@ const API = {
   action: (titleId, action) => `/api/titles/${encodeURIComponent(titleId)}/${action}`,
 };
 
+const SOURCE_TYPES = {
+  official: {
+    label: "Official",
+    className: "ok",
+    installAllowed: true,
+    description: "Echte Installation",
+  },
+  external: {
+    label: "External",
+    className: "external",
+    installAllowed: true,
+    description: "Echte externe Installation",
+  },
+  shadowmount: {
+    label: "Shadowmount",
+    className: "shadow",
+    installAllowed: false,
+    description: "Download only",
+  },
+  unknown: {
+    label: "Unknown",
+    className: "blocked",
+    installAllowed: false,
+    description: "Blockiert",
+  },
+};
+
 const fallback = {
   status: {
     firmware: "11.60",
@@ -20,6 +47,12 @@ const fallback = {
     download_dir: "/mnt/usb0/patches",
     install_after_download: false,
     delete_pkg_after_install: false,
+    source_policy: {
+      official: { allow_check: true, allow_download: true, allow_install: true },
+      external: { allow_check: true, allow_download: true, allow_install: true },
+      shadowmount: { allow_check: true, allow_download: true, allow_install: false },
+      unknown: { allow_check: true, allow_download: false, allow_install: false },
+    },
     cdn_allowlist: [
       "sgst.prod.dl.playstation.net",
       "gst.prod.dl.playstation.net",
@@ -35,6 +68,9 @@ const fallback = {
       compatible_version: "01.041.000",
       latest_version: "01.041.000",
       latest_required_fw: "11.60",
+      source_type: "official",
+      source_path: "/system_ex/app/PPSA01628_00",
+      mount_from: "/dev/ssd0.system_ex",
       enabled: true,
       mode: "latest_compatible",
       queued: false,
@@ -48,6 +84,9 @@ const fallback = {
       compatible_version: "01.004.000",
       latest_version: "01.004.000",
       latest_required_fw: "10.01",
+      source_type: "external",
+      source_path: "/system_data/priv/appmeta/external/PPSA01284_00",
+      mount_from: "/mnt/ext0/user/app/PPSA01284_00",
       enabled: true,
       mode: "pin",
       max_content_ver: "01.004.000",
@@ -62,10 +101,29 @@ const fallback = {
       compatible_version: null,
       latest_version: "01.012.000",
       latest_required_fw: "12.50",
+      source_type: "unknown",
+      source_path: "/system_ex/app/PPSA08329_00",
+      mount_from: "",
       enabled: false,
       mode: "disabled",
       queued: false,
       status: "blocked",
+    },
+    {
+      title_id: "PPSA90001_00",
+      name: "Shadowmounted Test Title",
+      content_id: "UP0000-PPSA90001_00-SHADOWMOUNT0001",
+      installed_version: "01.000.000",
+      compatible_version: "01.006.000",
+      latest_version: "01.009.000",
+      latest_required_fw: "12.00",
+      source_type: "shadowmount",
+      source_path: "/system_ex/app/PPSA90001_00",
+      mount_from: "/mnt/usb0/itemzflow/Shadowmounted Test Title",
+      enabled: true,
+      mode: "download_only",
+      queued: false,
+      status: "available",
     },
   ],
   downloads: [
@@ -116,6 +174,7 @@ function bindElements() {
     queueList: document.getElementById("queueList"),
     logOutput: document.getElementById("logOutput"),
     allowlistHosts: document.getElementById("allowlistHosts"),
+    sourcePolicyList: document.getElementById("sourcePolicyList"),
     searchInput: document.getElementById("searchInput"),
     defaultPolicy: document.getElementById("defaultPolicy"),
     downloadDir: document.getElementById("downloadDir"),
@@ -207,6 +266,7 @@ function renderSettings() {
     chip.textContent = host;
     return chip;
   }));
+  renderSourcePolicies();
 }
 
 function renderGames() {
@@ -227,6 +287,7 @@ function renderGames() {
 function matchesFilter(game) {
   if (state.filter === "enabled") return game.enabled;
   if (state.filter === "available") return game.status === "available";
+  if (state.filter === "shadowmount") return sourceType(game) === "shadowmount";
   if (state.filter === "blocked") return game.status === "blocked";
   if (state.filter === "queued") return game.queued || game.status === "queued";
   return true;
@@ -235,6 +296,7 @@ function matchesFilter(game) {
 function matchesQuery(game) {
   if (!state.query) return true;
   return [game.name, game.title_id, game.content_id]
+    .concat([game.source_type, game.source_path, game.mount_from])
     .filter(Boolean)
     .some((value) => value.toLowerCase().includes(state.query));
 }
@@ -245,6 +307,7 @@ function createGameCard(game) {
 
   const title = document.createElement("div");
   title.className = "game-title";
+  const installBlocked = isInstallBlocked(game);
   title.innerHTML = `
     <div class="cover">${initials(game.name)}</div>
     <div>
@@ -255,8 +318,11 @@ function createGameCard(game) {
       </div>
       <div class="subline" style="margin-top:8px">
         ${statusPill(game)}
+        ${sourcePill(game)}
+        ${installBlocked ? `<span class="pill blocked">Install gesperrt</span>` : `<span class="pill ok">Install erlaubt</span>`}
         <span class="pill">${game.enabled ? "Aktiv" : "Aus"}</span>
       </div>
+      <div class="source-path">${escapeHtml(sourceDetail(game))}</div>
     </div>
   `;
 
@@ -306,7 +372,7 @@ function createGameCard(game) {
       <svg><use href="#icon-refresh"></use></svg>
       Pruefen
     </button>
-    <button class="row-button is-primary" data-action="download" ${!game.compatible_version ? "disabled" : ""}>
+    <button class="row-button is-primary" data-action="download" ${!isDownloadAllowed(game) ? "disabled" : ""} title="${escapeHtml(downloadTitle(game))}">
       <svg><use href="#icon-download"></use></svg>
       Laden
     </button>
@@ -331,10 +397,37 @@ function versionBox(label, value) {
 }
 
 function statusPill(game) {
-  if (game.status === "blocked") return `<span class="pill blocked">FW blockiert</span>`;
+  if (game.status === "blocked") return `<span class="pill blocked">${escapeHtml(blockedLabel(game))}</span>`;
   if (game.status === "queued") return `<span class="pill warn">In Queue</span>`;
   if (game.status === "available") return `<span class="pill ok">Update verfuegbar</span>`;
   return `<span class="pill">Aktuell</span>`;
+}
+
+function sourcePill(game) {
+  const info = sourceInfo(game);
+  return `<span class="pill ${info.className}">${escapeHtml(info.label)}</span>`;
+}
+
+function sourceInfo(game) {
+  return SOURCE_TYPES[sourceType(game)] || SOURCE_TYPES.unknown;
+}
+
+function sourceType(game) {
+  return game.source_type || "unknown";
+}
+
+function sourceDetail(game) {
+  const src = sourceType(game);
+  if (src === "shadowmount") return `Mount: ${game.mount_from || "unbekannte Quelle"}`;
+  if (src === "external") return `External: ${game.source_path || "externe App-Metadaten"}`;
+  if (src === "official") return game.source_path || "Offizielle Installation";
+  return "Quelle nicht eindeutig erkannt";
+}
+
+function blockedLabel(game) {
+  if (sourceType(game) === "unknown") return "Quelle unbekannt";
+  if (!game.compatible_version) return "FW blockiert";
+  return "Blockiert";
 }
 
 function renderQueue() {
@@ -360,6 +453,22 @@ function renderQueue() {
     `;
     els.queueList.appendChild(row);
   });
+}
+
+function renderSourcePolicies() {
+  const rows = Object.keys(SOURCE_TYPES).map((type) => {
+    const info = SOURCE_TYPES[type];
+    const policy = sourcePolicyForType(type);
+    const row = document.createElement("div");
+    row.className = "policy-row";
+    row.innerHTML = `
+      <span class="pill ${info.className}">${escapeHtml(info.label)}</span>
+      <strong>${policy.allow_install ? "Install erlaubt" : "Install gesperrt"}</strong>
+      <em>${policy.allow_download ? "Download erlaubt" : "Download gesperrt"} - ${escapeHtml(info.description)}</em>
+    `;
+    return row;
+  });
+  els.sourcePolicyList.replaceChildren(...rows);
 }
 
 function renderLogs() {
@@ -391,6 +500,11 @@ async function runTitleAction(titleId, action) {
   const game = state.titles.find((item) => item.title_id === titleId);
   if (!game) return;
 
+  if (action === "download" && !isDownloadAllowed(game)) {
+    showToast(downloadTitle(game));
+    return;
+  }
+
   try {
     await postJson(API.action(titleId, action), {});
   } catch (error) {
@@ -398,6 +512,9 @@ async function runTitleAction(titleId, action) {
   }
 
   if (action === "download" && game.compatible_version) {
+    const detail = isInstallBlocked(game)
+      ? "Download only - Install durch Source-Policy gesperrt"
+      : "Wartet auf Start";
     game.queued = true;
     game.status = "queued";
     if (!state.downloads.some((item) => item.title_id === titleId)) {
@@ -406,10 +523,10 @@ async function runTitleAction(titleId, action) {
         name: game.name,
         version: game.compatible_version,
         progress: 0,
-        detail: "Wartet auf Start",
+        detail,
       });
     }
-    state.logs.push(`[${timeNow()}] Queued ${game.title_id} ${game.compatible_version}`);
+    state.logs.push(`[${timeNow()}] Queued ${game.title_id} ${game.compatible_version} (${sourceType(game)}, install=${isInstallBlocked(game) ? "blocked" : "allowed"})`);
     showToast(`${game.title_id} wurde zur Queue hinzugefuegt.`);
   } else {
     state.logs.push(`[${timeNow()}] Check requested for ${game.title_id}`);
@@ -424,11 +541,43 @@ async function runTitleAction(titleId, action) {
 function updateGame(titleId, patch) {
   const game = state.titles.find((item) => item.title_id === titleId);
   if (!game) return;
+  if (sourceType(game) === "unknown" && patch.mode && !["disabled", "check_only"].includes(patch.mode)) {
+    patch.mode = "check_only";
+    patch.enabled = true;
+    showToast(`${titleId}: Quelle unbekannt, nur Check only erlaubt.`);
+  }
   Object.assign(game, patch);
   if (patch.mode === "disabled") game.enabled = false;
   state.logs.push(`[${timeNow()}] Policy updated for ${titleId}`);
   renderGames();
   renderLogs();
+}
+
+function isDownloadAllowed(game) {
+  const policy = sourcePolicy(game);
+  return Boolean(game.enabled && game.compatible_version && policy.allow_download);
+}
+
+function isInstallBlocked(game) {
+  return !sourcePolicy(game).allow_install;
+}
+
+function sourcePolicy(game) {
+  return sourcePolicyForType(sourceType(game));
+}
+
+function sourcePolicyForType(type) {
+  const fallbackPolicy = fallback.config.source_policy[type] || fallback.config.source_policy.unknown;
+  const configuredPolicy = (state.config.source_policy || {})[type] || {};
+  return { ...fallbackPolicy, ...configuredPolicy };
+}
+
+function downloadTitle(game) {
+  if (!game.enabled) return "Titel ist deaktiviert.";
+  if (!game.compatible_version) return "Keine kompatible Update-Version verfuegbar.";
+  if (!sourcePolicy(game).allow_download) return "Download ist fuer diese Quelle gesperrt.";
+  if (isInstallBlocked(game)) return "Download erlaubt, Installation bleibt fuer diese Quelle gesperrt.";
+  return "Kompatibles Update laden.";
 }
 
 async function postJson(url, body) {

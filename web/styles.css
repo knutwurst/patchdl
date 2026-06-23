@@ -377,10 +377,32 @@ h2 {
   color: #81500b;
 }
 
+.pill.external {
+  border-color: #b7d8e8;
+  background: var(--blue-soft);
+  color: #1e547a;
+}
+
+.pill.shadow {
+  border-color: #d0c4eb;
+  background: #eee8fb;
+  color: #584080;
+}
+
 .pill.blocked {
   border-color: #f0b8b8;
   background: var(--red-soft);
   color: var(--red);
+}
+
+.source-path {
+  margin-top: 8px;
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .version-grid {
@@ -521,7 +543,8 @@ h2 {
 }
 
 .field span,
-.allowlist > span {
+.allowlist > span,
+.source-policy > span {
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;
@@ -576,10 +599,45 @@ h2 {
   margin-top: 14px;
 }
 
+.source-policy {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
 .allowlist div {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+}
+
+.source-policy > div {
+  display: grid;
+  gap: 8px;
+}
+
+.policy-row {
+  display: grid;
+  grid-template-columns: 110px minmax(100px, 0.8fr) minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  background: #f8f9f6;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.policy-row strong {
+  font-size: 13px;
+}
+
+.policy-row em {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .host-chip {
@@ -701,8 +759,13 @@ pre {
   .toolbar,
   .split-band,
   .status-strip,
-  .version-grid {
+  .version-grid,
+  .policy-row {
     grid-template-columns: 1fr;
+  }
+
+  .policy-row em {
+    white-space: normal;
   }
 
   .segmented {

@@ -28,6 +28,12 @@ The UI assumes deny-by-default behavior:
   "download_dir": "/mnt/usb0/patches",
   "install_after_download": false,
   "delete_pkg_after_install": false,
+  "source_policy": {
+    "official": { "allow_check": true, "allow_download": true, "allow_install": true },
+    "external": { "allow_check": true, "allow_download": true, "allow_install": true },
+    "shadowmount": { "allow_check": true, "allow_download": true, "allow_install": false },
+    "unknown": { "allow_check": true, "allow_download": false, "allow_install": false }
+  },
   "cdn_allowlist": [
     "sgst.prod.dl.playstation.net",
     "gst.prod.dl.playstation.net",
@@ -45,3 +51,30 @@ latest_compatible
 pin
 check_only
 ```
+
+Per-title source fields:
+
+```json
+{
+  "title_id": "PPSA90001_00",
+  "name": "Shadowmounted Test Title",
+  "source_type": "shadowmount",
+  "source_path": "/system_ex/app/PPSA90001_00",
+  "mount_from": "/mnt/usb0/itemzflow/Shadowmounted Test Title",
+  "enabled": true,
+  "mode": "download_only"
+}
+```
+
+Supported `source_type` values:
+
+```text
+official
+external
+shadowmount
+unknown
+```
+
+The frontend treats `shadowmount` as download-only and `unknown` as blocked for
+downloads and installs. Backend code should enforce the same policy even if a
+client sends a forged request.
