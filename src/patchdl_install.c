@@ -148,8 +148,9 @@ fill_probe(void) {
     uint32_t h = 0;
     int ai_loaded   = (kernel_dynlib_handle(-1, "libSceAppInstUtil.sprx", &h) >= 0);
     int bgft_loaded = (kernel_dynlib_handle(-1, "libSceBgft.sprx", &h) >= 0);
-    size_t n = 0, sz = sizeof(g_probe_json);
-    char  *out = g_probe_json;
+    char   tmp[sizeof(g_probe_json)];
+    size_t n = 0, sz = sizeof(tmp);
+    char  *out = tmp;
     int    first = 1;
 
     n += snprintf(out + n, sz - n,
@@ -168,6 +169,12 @@ fill_probe(void) {
         first = 0;
     }
     snprintf(out + n, sz - n, "}}");
+
+    /* Publish atomically: the getter runs on an MHD worker thread and reads
+       g_probe_json under the same lock, so it never sees a half-built buffer. */
+    pthread_mutex_lock(&g_mtx);
+    memcpy(g_probe_json, tmp, sizeof(g_probe_json));
+    pthread_mutex_unlock(&g_mtx);
 }
 
 static void *
@@ -261,11 +268,17 @@ patchdl_install_backend_check(char *msg, size_t msg_sz) {
    reads the cached string — it never loads modules or resolves symbols here. */
 int
 patchdl_install_api_probe(char *out, size_t out_sz) {
+    int ready;
+
     backend_start();
-    if (g_probe_json[0]) {
+    pthread_mutex_lock(&g_mtx);
+    ready = (g_probe_json[0] != '\0');
+    if (ready)
         snprintf(out, out_sz, "%s", g_probe_json);
+    pthread_mutex_unlock(&g_mtx);
+    if (ready)
         return 0;
-    }
+
     snprintf(out, out_sz,
              "{\"pending\":true,\"stage\":\"%s\"}", stage_str(g_stage));
     return -1;
@@ -342,7 +355,7 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         ai_meta_info_t   meta   = {0};
         ai_pkg_info_t    pkg    = {0};
         ai_playgo_info_t playgo = {0};
-        int              rc2;
+        int              rc2    = -1;
         const char      *title_dir;
         const char      *file_base;
 

@@ -295,24 +295,43 @@ file_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
     return fwrite(ptr, size, nmemb, (FILE *)userdata);
 }
 
-int
-patchdl_http_download(const char *url, const char *dest_path,
-                      long long *bytes_out) {
+typedef struct {
+    patchdl_download_progress_cb cb;
+    void *ctx;
+    long long base;
+    long long total;
+} progress_state_t;
+
+static int
+curl_progress_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
+                 curl_off_t ultotal, curl_off_t ulnow) {
+    progress_state_t *p = (progress_state_t *)clientp;
+    long long total;
+
+    (void)ultotal;
+    (void)ulnow;
+    if (!p || !p->cb) return 0;
+
+    total = p->total > 0 ? p->total : (long long)dltotal;
+    /* A non-zero return aborts the transfer (CURLE_ABORTED_BY_CALLBACK),
+       which is how a cancel request stops a piece mid-flight. */
+    return p->cb(p->ctx, p->base + (long long)dlnow, total);
+}
+
+static int
+http_download_to_file_progress(const char *url, FILE *fp, long long *bytes_out,
+                               progress_state_t *progress) {
     CURL             *curl;
     CURLcode          res;
     char              host[256], ip[INET_ADDRSTRLEN], rs443[512], rs80[512];
     struct curl_slist *rl = NULL;
     struct curl_blob  ca_blob;
-    FILE             *fp;
     curl_off_t        dl = 0;
 
     if (bytes_out) *bytes_out = 0;
     if (url_host(url, host, sizeof(host))) return -1;
     if (!host_allowed(host)) return -1;
     if (dns_lookup(host, ip, sizeof(ip))) return -1;
-
-    fp = fopen(dest_path, "wb");
-    if (!fp) return -1;
 
     snprintf(rs443, sizeof(rs443), "%s:443:%s", host, ip);
     rl = curl_slist_append(NULL, rs443);
@@ -324,7 +343,7 @@ patchdl_http_download(const char *url, const char *dest_path,
     ca_blob.flags = CURL_BLOB_COPY;
 
     curl = curl_easy_init();
-    if (!curl) { fclose(fp); curl_slist_free_all(rl); return -1; }
+    if (!curl) { curl_slist_free_all(rl); return -1; }
 
     curl_easy_setopt(curl, CURLOPT_URL,             url);
     curl_easy_setopt(curl, CURLOPT_RESOLVE,         rl);
@@ -341,19 +360,185 @@ patchdl_http_download(const char *url, const char *dest_path,
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,  30L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT,       "patchdl/1.0");
+    if (progress && progress->cb) {
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS,       0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_progress_cb);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA,     progress);
+    }
 
     res = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_SIZE_DOWNLOAD_T, &dl);
     curl_easy_cleanup(curl);
     curl_slist_free_all(rl);
+
+    if (res != CURLE_OK) return -1;
+    if (bytes_out) *bytes_out = (long long)dl;
+    return 0;
+}
+
+int
+patchdl_http_download_progress(const char *url, const char *dest_path,
+                               long long *bytes_out,
+                               patchdl_download_progress_cb cb, void *ctx) {
+    FILE *fp = fopen(dest_path, "wb");
+    progress_state_t progress = { cb, ctx, 0, 0 };
+    int rc;
+
+    if (!fp) return -1;
+    rc = http_download_to_file_progress(url, fp, bytes_out, &progress);
     fclose(fp);
 
-    if (res != CURLE_OK) {
+    if (rc) {
         unlink(dest_path);
         return -1;
     }
-    if (bytes_out) *bytes_out = (long long)dl;
     return 0;
+}
+
+int
+patchdl_http_download(const char *url, const char *dest_path,
+                      long long *bytes_out) {
+    return patchdl_http_download_progress(url, dest_path, bytes_out, NULL, NULL);
+}
+
+static int
+json_string_after(const char *p, const char *key, char *out, size_t out_sz) {
+    char needle[48];
+    const char *q;
+    size_t n = 0;
+
+    if (!p || !out || out_sz == 0) return -1;
+    out[0] = '\0';
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    q = strstr(p, needle);
+    if (!q) return -1;
+    q += strlen(needle);
+    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+    if (*q++ != ':') return -1;
+    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+    if (*q++ != '"') return -1;
+
+    while (*q && *q != '"' && n + 1 < out_sz) {
+        if (*q == '\\' && q[1]) q++;
+        out[n++] = *q++;
+    }
+    out[n] = '\0';
+    return n ? 0 : -1;
+}
+
+static int
+json_u64_after(const char *p, const char *key, unsigned long long *out) {
+    char needle[48];
+    const char *q;
+
+    if (!p || !out) return -1;
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    q = strstr(p, needle);
+    if (!q) return -1;
+    q += strlen(needle);
+    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+    if (*q++ != ':') return -1;
+    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+    if (*q < '0' || *q > '9') return -1;
+    *out = strtoull(q, NULL, 10);
+    return 0;
+}
+
+int
+patchdl_http_download_manifest_progress(const char *manifest_url,
+                                        const char *dest_path,
+                                        long long *bytes_out,
+                                        patchdl_download_progress_cb cb,
+                                        void *ctx) {
+    patchdl_buf_t manifest;
+    const char *pieces;
+    const char *p;
+    FILE *fp;
+    long long total = 0;
+    unsigned long long manifest_total = 0;
+    int count = 0;
+    int rc = -1;
+
+    if (bytes_out) *bytes_out = 0;
+    if (patchdl_http_get(manifest_url, &manifest))
+        return -1;
+    if (!manifest.data || !manifest.size) {
+        free(manifest.data);
+        return -1;
+    }
+
+    pieces = strstr(manifest.data, "\"pieces\"");
+    if (!pieces || !(pieces = strchr(pieces, '['))) {
+        free(manifest.data);
+        return -1;
+    }
+    /* Bound the scan to the pieces array; otherwise a later "url" key in the
+       manifest (e.g. playgoChunkCrcUrl) could be appended as a bogus piece. */
+    const char *pieces_end = strchr(pieces, ']');
+    json_u64_after(manifest.data, "originalFileSize", &manifest_total);
+
+    fp = fopen(dest_path, "wb");
+    if (!fp) {
+        free(manifest.data);
+        return -1;
+    }
+
+    p = pieces;
+    while ((p = strstr(p, "\"url\"")) && (!pieces_end || p < pieces_end)) {
+        char url[768];
+        long long got = 0;
+        unsigned long long expected = 0;
+        unsigned long long offset = 0;
+        int have_offset;
+        const char *obj_end = strchr(p, '}');
+        progress_state_t progress = {
+            cb,
+            ctx,
+            total,
+            manifest_total ? (long long)manifest_total : 0
+        };
+
+        if (json_string_after(p, "url", url, sizeof(url)))
+            break;
+        json_u64_after(p, "fileSize", &expected);
+        have_offset = (json_u64_after(p, "fileOffset", &offset) == 0);
+
+        /* Pieces are concatenated in array order; each one's fileOffset must
+           equal the bytes written so far. A manifest that lists them out of
+           order would otherwise silently produce a corrupt package. */
+        if (have_offset && offset != (unsigned long long)total)
+            goto done;
+
+        if (http_download_to_file_progress(url, fp, &got, &progress))
+            goto done;                 /* network error or cancel mid-piece */
+        if (expected && (unsigned long long)got != expected)
+            goto done;
+
+        total += got;
+        /* A non-zero callback return between pieces means cancel requested. */
+        if (cb && cb(ctx, total, manifest_total ? (long long)manifest_total : total))
+            goto done;
+        count++;
+        p = obj_end ? obj_end + 1 : p + 5;
+    }
+
+    if (count > 0) {
+        rc = 0;
+        if (bytes_out) *bytes_out = total;
+    }
+
+done:
+    fclose(fp);
+    free(manifest.data);
+    if (rc) unlink(dest_path);
+    return rc;
+}
+
+int
+patchdl_http_download_manifest(const char *manifest_url, const char *dest_path,
+                               long long *bytes_out) {
+    return patchdl_http_download_manifest_progress(manifest_url, dest_path,
+                                                  bytes_out, NULL, NULL);
 }
 
 void
@@ -425,6 +610,32 @@ patchdl_http_download(const char *url, const char *dest_path,
     (void)url; (void)dest_path;
     if (bytes_out) *bytes_out = 0;
     return -1;
+}
+
+int
+patchdl_http_download_progress(const char *url, const char *dest_path,
+                               long long *bytes_out,
+                               patchdl_download_progress_cb cb, void *ctx) {
+    (void)cb; (void)ctx;
+    return patchdl_http_download(url, dest_path, bytes_out);
+}
+
+int
+patchdl_http_download_manifest(const char *manifest_url, const char *dest_path,
+                               long long *bytes_out) {
+    (void)manifest_url; (void)dest_path;
+    if (bytes_out) *bytes_out = 0;
+    return -1;
+}
+
+int
+patchdl_http_download_manifest_progress(const char *manifest_url,
+                                        const char *dest_path,
+                                        long long *bytes_out,
+                                        patchdl_download_progress_cb cb,
+                                        void *ctx) {
+    (void)cb; (void)ctx;
+    return patchdl_http_download_manifest(manifest_url, dest_path, bytes_out);
 }
 
 void

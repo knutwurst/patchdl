@@ -44,6 +44,11 @@ attr_val(const char *tag_start, const char *tag_end, const char *attr,
         p += strlen(needle);
         for (len = 0; p + len < tag_end && p[len] != '"' && len < out_sz - 1; len++)
             ;
+        /* The value must actually end on its closing quote inside the tag —
+           otherwise we hit tag_end or the buffer limit and would return a
+           silently truncated URL/title as if it were valid. */
+        if (p + len >= tag_end || p[len] != '"')
+            return -1;
         memcpy(out, p, len);
         out[len] = '\0';
         return 0;
@@ -130,13 +135,18 @@ parse_packages(const char *xml, uint32_t fw_bin, patchdl_verinfo_t *out) {
                               sizeof(out->latest_required_fw));
             }
 
-            /* Track latest compatible + its patch URL */
+            /* Track latest compatible + its installable patch source. PS5
+               updates expose a small delta_url (DP.pkg) plus a manifest_url
+               containing the actual split package pieces. Feeding the DP
+               bootstrap directly can make the system download the full patch
+               under the storage/master title id, so prefer the target-title
+               manifest whenever present. */
             if (pkg_sver <= fw_bin) {
                 if (!out->compatible_version[0] ||
                     ver_gt(ver, out->compatible_version)) {
                     strncpy(out->compatible_version, ver,
                             sizeof(out->compatible_version) - 1);
-                    strncpy(out->compatible_url, durl,
+                    strncpy(out->compatible_url, murl[0] ? murl : durl,
                             sizeof(out->compatible_url) - 1);
                     extract_title_id(durl, out->compatible_storage_title,
                                      sizeof(out->compatible_storage_title));

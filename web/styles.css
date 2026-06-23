@@ -493,13 +493,36 @@ h2 {
 
 .queue-item {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 92px;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 12px;
   align-items: center;
   padding: 12px;
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: 8px;
+}
+
+.queue-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.queue-item .queue-actions span {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.row-button.is-danger {
+  border-color: var(--red);
+  color: var(--red);
+  background: var(--red-soft);
+}
+
+.row-button.is-danger:hover {
+  background: rgba(255, 107, 107, 0.26);
 }
 
 .queue-item strong {

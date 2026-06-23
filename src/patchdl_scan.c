@@ -140,13 +140,23 @@ sfo_get(const uint8_t *buf, size_t bufsz, const char *key,
 
     entries = (const sfo_entry_t *)(buf + sizeof(*h));
 
+    /* The entry table itself must fit in the bytes we actually read; a crafted
+       param.sfo (from a shadow-mounted game dir) could otherwise drive
+       entries[i] past the buffer. */
+    if (sizeof(*h) + (size_t)h->num_entries * sizeof(sfo_entry_t) > bufsz)
+        return -1;
+
     for (i = 0; i < h->num_entries; i++) {
         size_t key_off = h->key_table_start  + entries[i].key_offset;
         size_t val_off = h->data_table_start + entries[i].data_offset;
 
         if (key_off >= bufsz || val_off >= bufsz) continue;
 
-        const char *k = (const char *)(buf + key_off);
+        const char *k    = (const char *)(buf + key_off);
+        size_t      kmax = bufsz - key_off;
+        /* Require the key to be NUL-terminated within the buffer before the
+           strcmp, otherwise it would read past the end. */
+        if (strnlen(k, kmax) == kmax) continue;
         if (strcmp(k, key)) continue;
         if (entries[i].data_fmt != SFO_FMT_STR) return -1;
 

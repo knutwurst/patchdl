@@ -34,16 +34,26 @@ find_pid(const char *name) {
     if (!(buf = malloc(buf_size)))          return -1;
     if (sysctl(mib, 4, buf, &buf_size, 0, 0)) { free(buf); return -1; }
 
-    for (uint8_t *ptr = buf; ptr < buf + buf_size; ) {
-        int   ki_structsize = *(int *)(ptr + KINFO_OFF_STRUCTSIZE);
-        pid_t ki_pid        = *(pid_t *)(ptr + KINFO_OFF_PID);
-        char *ki_tdname     = (char *)(ptr + KINFO_OFF_TDNAME);
+    /* The loop guard guarantees the structsize/pid/tdname fields are inside the
+       buffer before we read them, and the per-record check below keeps the name
+       compare within the record (and thus the buffer). */
+    for (uint8_t *ptr = buf; ptr + KINFO_OFF_TDNAME < buf + buf_size; ) {
+        int    ki_structsize = *(int *)(ptr + KINFO_OFF_STRUCTSIZE);
+        pid_t  ki_pid;
+        char  *ki_tdname;
+        size_t name_max;
 
-        if (ki_structsize <= 0) break; /* guard against malformed entries */
-        ptr += ki_structsize;
+        if (ki_structsize <= KINFO_OFF_TDNAME) break;   /* malformed/truncated */
+        if (ptr + ki_structsize > buf + buf_size) break; /* record past buffer */
 
-        if (!strcmp(name, ki_tdname) && ki_pid != mypid)
+        ki_pid   = *(pid_t *)(ptr + KINFO_OFF_PID);
+        ki_tdname = (char *)(ptr + KINFO_OFF_TDNAME);
+        name_max  = (size_t)(ptr + ki_structsize - (uint8_t *)ki_tdname);
+
+        if (!strncmp(name, ki_tdname, name_max) && ki_pid != mypid)
             pid = ki_pid;
+
+        ptr += ki_structsize;
     }
 
     free(buf);

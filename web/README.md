@@ -83,3 +83,8 @@ unknown
 The frontend treats `shadowmount` as download-only and `unknown` as blocked for
 downloads and installs. Backend code should enforce the same policy even if a
 client sends a forged request.
+
+For PS5 game updates, the backend may turn a Sony `manifest_url` into a merged
+local `.pkg` by downloading all manifest pieces. The `delta_url` `*-DP.pkg` is
+not shown as a separate user action because it can bootstrap the storage/master
+title instead of the installed regional target.

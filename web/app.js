@@ -126,21 +126,8 @@ const fallback = {
       status: "available",
     },
   ],
-  downloads: [
-    {
-      title_id: "PPSA01284_00",
-      name: "Demon's Souls",
-      version: "01.004.000",
-      progress: 64,
-      detail: "4.8 GB of 7.5 GB",
-    },
-  ],
-  logs: [
-    "[12:41:02] nanoDNS guard detected: Sony domains blocked",
-    "[12:41:04] Internal resolver ready for 3 CDN hosts",
-    "[12:41:07] PPSA01284_00 selected: pin 01.004.000",
-    "[12:41:09] Download started: PPSA01284_00 01.004.000",
-  ],
+  downloads: [],
+  logs: [],
 };
 
 let state = {
@@ -153,6 +140,7 @@ let state = {
   query: "",
   usingFallback: false,
 };
+let downloadPollTimer = null;
 
 const els = {};
 
@@ -208,12 +196,25 @@ function bindEvents() {
 }
 
 async function loadInitialData() {
+  state.usingFallback = false;
   const [status, config, titles, downloads] = await Promise.all([
     getJson(API.status, fallback.status),
     getJson(API.config, fallback.config),
     getJson(API.titles, fallback.titles),
     getJson(API.downloads, fallback.downloads),
   ]);
+
+  // /api/titles has no client-only progress fields, so carry them across a
+  // refresh — otherwise an in-flight download/install would flip the card back
+  // to a clickable "Download/Install" mid-operation.
+  const prev = new Map(state.titles.map((g) => [g.title_id, g]));
+  titles.forEach((g) => {
+    const old = prev.get(g.title_id);
+    if (!old) return;
+    if (old.downloading) g.downloading = true;
+    if (old.downloaded) g.downloaded = true;
+    if (old.installing) g.installing = true;
+  });
 
   state = {
     ...state,
@@ -224,6 +225,7 @@ async function loadInitialData() {
   };
 
   render();
+  if (state.downloads.length) startDownloadPolling();
   showToast(state.usingFallback ? "Demo data loaded. API is not reachable yet." : "Data refreshed.");
 }
 
@@ -390,6 +392,18 @@ function createGameCard(game) {
     actions.appendChild(btn);
   }
 
+  // Cancel an in-progress download, or delete a finished/leftover one.
+  if (game.downloading || game.downloaded) {
+    const del = document.createElement("button");
+    del.className = "row-button is-danger";
+    del.textContent = game.downloading ? "Cancel" : "Delete";
+    del.title = game.downloading
+      ? "Stop the download and delete the partial file"
+      : "Delete the downloaded package";
+    del.addEventListener("click", () => cancelDownload(game.title_id));
+    actions.appendChild(del);
+  }
+
   controls.append(actions);
   card.append(title, versions, controls);
   return card;
@@ -449,16 +463,29 @@ function renderQueue() {
   }
 
   state.downloads.forEach((item) => {
+    const pct = Math.max(0, Math.min(100, Number(item.progress) || 0));
     const row = document.createElement("div");
     row.className = "queue-item";
-    row.innerHTML = `
-      <div>
-        <strong>${escapeHtml(item.name)}</strong>
-        <span>${escapeHtml(item.title_id)} - ${escapeHtml(item.version)} - ${escapeHtml(item.detail || "")}</span>
-        <div class="progress"><i style="width:${Math.max(0, Math.min(100, item.progress || 0))}%"></i></div>
-      </div>
-      <span>${item.progress || 0}%</span>
+
+    const info = document.createElement("div");
+    info.innerHTML = `
+      <strong>${escapeHtml(item.name)}</strong>
+      <span>${escapeHtml(item.title_id)} - ${escapeHtml(item.version)} - ${escapeHtml(item.detail || "")}</span>
+      <div class="progress"><i style="width:${pct}%"></i></div>
     `;
+
+    const right = document.createElement("div");
+    right.className = "queue-actions";
+    const span = document.createElement("span");
+    span.textContent = `${pct}%`;
+    const cancel = document.createElement("button");
+    cancel.className = "row-button is-danger";
+    cancel.textContent = "Cancel";
+    cancel.title = "Stop the download and delete the partial file";
+    cancel.addEventListener("click", () => cancelDownload(item.title_id));
+    right.append(span, cancel);
+
+    row.append(info, right);
     els.queueList.appendChild(row);
   });
 }
@@ -480,7 +507,63 @@ function renderSourcePolicies() {
 }
 
 function renderLogs() {
-  els.logOutput.textContent = state.logs.join("\n");
+  els.logOutput.textContent = state.logs.length ? state.logs.join("\n") : "No events yet.";
+}
+
+let emptyPolls = 0;
+
+function startDownloadPolling() {
+  emptyPolls = 0;
+  if (downloadPollTimer) return;
+  downloadPollTimer = setInterval(refreshDownloads, 2000);
+  refreshDownloads();
+}
+
+function stopDownloadPolling() {
+  if (!downloadPollTimer) return;
+  clearInterval(downloadPollTimer);
+  downloadPollTimer = null;
+}
+
+async function refreshDownloads() {
+  try {
+    const response = await fetch(API.downloads, { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const downloads = await response.json();
+    state.downloads = downloads;
+    renderQueue();
+    // A single empty poll can happen between manifest fetch and first piece;
+    // only give up after a few in a row so a slow multi-GB job isn't dropped.
+    if (!downloads.length && !state.titles.some((game) => game.downloading)) {
+      if (++emptyPolls >= 3) stopDownloadPolling();
+    } else {
+      emptyPolls = 0;
+    }
+  } catch (error) {
+    /* Keep the last local queue row visible if polling fails transiently. */
+  }
+}
+
+// Cancel a running download (server aborts and deletes the partial) or delete
+// an already-downloaded package. Same endpoint handles both.
+async function cancelDownload(titleId) {
+  const game = state.titles.find((g) => g.title_id === titleId);
+  try {
+    await postJson(API.action(titleId, "cancel"), {});
+    showToast(`${game ? game.name : titleId}: download cancelled / deleted.`);
+  } catch (error) {
+    showToast(`${game ? game.name : titleId}: ${reasonText(error)}`);
+  }
+  if (game) {
+    game.downloading = false;
+    game.downloaded = false;
+  }
+  state.downloads = state.downloads.filter((item) => item.title_id !== titleId);
+  state.logs.push(`[${timeNow()}] Download cancelled / deleted: ${titleId}`);
+  renderGames();
+  renderQueue();
+  renderLogs();
+  refreshDownloads();
 }
 
 async function saveConfig() {
@@ -523,26 +606,59 @@ function rowAction(game) {
 
 async function doDownload(game) {
   game.downloading = true;
+  state.downloads = state.downloads.filter((item) => item.title_id !== game.title_id);
+  state.downloads.push({
+    title_id: game.title_id,
+    name: game.name,
+    version: game.compatible_version || "",
+    progress: 0,
+    detail: "Downloading manifest package internally. Large PS5 patches can take a long time.",
+  });
+  state.logs.push(`[${timeNow()}] Download started: ${game.title_id} ${game.compatible_version}`);
+  renderQueue();
+  renderLogs();
   renderGames();
+  startDownloadPolling();
   let r;
   try {
     r = await postJson(API.action(game.title_id, "download"), {});
   } catch (error) {
     game.downloading = false;
+    state.downloads = state.downloads.filter((item) => item.title_id !== game.title_id);
     const why = reasonText(error);
     state.logs.push(`[${timeNow()}] download ${game.title_id} blocked: ${why}`);
     showToast(`${game.name}: ${why}`);
     renderGames();
+    renderQueue();
     renderLogs();
+    stopDownloadPolling();
     return false;
   }
   game.downloading = false;
+  state.downloads = state.downloads.filter((item) => item.title_id !== game.title_id);
+
+  // A cancel (or soft failure) comes back as HTTP 200 with ok:false, so it
+  // isn't thrown — handle it here instead of marking the patch downloaded.
+  if (!r || r.ok === false) {
+    game.downloaded = false;
+    const what = r && r.cancelled ? "cancelled" : "failed";
+    state.logs.push(`[${timeNow()}] Download ${what}: ${game.title_id}`);
+    showToast(`${game.name}: download ${what}.`);
+    renderGames();
+    renderQueue();
+    renderLogs();
+    stopDownloadPolling();
+    return false;
+  }
+
   game.downloaded = true;
   const mb = r && r.bytes ? (r.bytes / (1024 * 1024)).toFixed(1) : "?";
   state.logs.push(`[${timeNow()}] Downloaded ${game.title_id} ${game.compatible_version} (${mb} MB, internal)`);
   showToast(`${game.name}: downloaded ${mb} MB.`);
   renderGames();
+  renderQueue();
   renderLogs();
+  stopDownloadPolling();
   return true;
 }
 
@@ -665,6 +781,7 @@ const REASON_TEXT = {
   source_unknown: "Source unknown — blocked.",
   no_compatible_patch: "No compatible patch available.",
   download_failed: "Download failed.",
+  download_in_progress: "Another download is already running.",
 };
 function reasonText(error) {
   const r = error && error.body && error.body.reason;

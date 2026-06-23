@@ -9,12 +9,14 @@
 
 #include <microhttpd.h>
 #include <pthread.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 static struct MHD_Daemon *web_daemon;
@@ -23,13 +25,9 @@ static patchdl_fw_t     g_fw;
 static patchdl_title_t *g_titles;
 static size_t           g_title_count;
 static pthread_mutex_t  g_mutex = PTHREAD_MUTEX_INITIALIZER;
-static char             g_status_json[512];
 static char            *g_debug_json; /* built once at startup */
 static unsigned long    g_pkg_hits;
 static char             g_pkg_diag_json[768] = "{\"hits\":0}";
-
-#define PATCHDL_DL_DIR    "/data/patchdl"
-#define PATCHDL_CFG_PATH  "/data/patchdl/config.json"
 
 /* Persisted, user-editable settings. Per-title enable/disable lives in the
    title structs (t->enabled) so it travels with the scan; the global fields
@@ -40,6 +38,20 @@ static struct {
     int  install_after_download;
     int  delete_pkg_after_install;
 } g_cfg = { "deny", 0, 1 };
+
+static struct {
+    int       active;
+    int       cancel;      /* set by a cancel request; the worker aborts */
+    char      title_id[32];
+    char      name[128];
+    char      version[16];
+    char      path[320];
+    long long downloaded;
+    long long total;
+} g_dl;
+
+#define PATCHDL_DL_DIR    "/data/patchdl"
+#define PATCHDL_CFG_PATH  "/data/patchdl/config.json"
 
 /* The source policy and CDN allowlist are fixed (the safety model), so they
    stay constant; only the four mutable fields above are user-controlled. */
@@ -56,9 +68,6 @@ static const char config_tail_json[] =
   "\"gst.prod.dl.playstation.net\","
   "\"gs2.ww.prod.dl.playstation.net\""
   "]}";
-
-static const char downloads_json[] = "[]";
-
 /* ---------- tiny JSON value lookups (flat objects only) ----------------- */
 
 /* Find `"key"` then the following `true`/`false`; returns dflt if absent. */
@@ -220,6 +229,39 @@ path_segment_safe(const char *s) {
     return 1;
 }
 
+typedef struct {
+    int      fd;
+    uint64_t start;
+    uint64_t size;
+} pkg_reader_t;
+
+static ssize_t
+pkg_reader_cb(void *cls, uint64_t pos, char *buf, size_t max) {
+    pkg_reader_t *r = (pkg_reader_t *)cls;
+    uint64_t rem;
+    ssize_t n;
+
+    if (!r || pos >= r->size)
+        return MHD_CONTENT_READER_END_WITH_ERROR;
+
+    rem = r->size - pos;
+    if ((uint64_t)max > rem)
+        max = (size_t)rem;
+
+    n = pread(r->fd, buf, max, (off_t)(r->start + pos));
+    if (n <= 0)
+        return MHD_CONTENT_READER_END_WITH_ERROR;
+    return n;
+}
+
+static void
+pkg_reader_free(void *cls) {
+    pkg_reader_t *r = (pkg_reader_t *)cls;
+    if (!r) return;
+    close(r->fd);
+    free(r);
+}
+
 static void
 record_pkg_diag(const char *url, const char *range, unsigned int status,
                 uint64_t start, uint64_t end, uint64_t total) {
@@ -250,6 +292,7 @@ queue_pkg_file(struct MHD_Connection *conn, const char *url) {
     unsigned int status = MHD_HTTP_OK;
     char content_range[96];
     struct MHD_Response *resp;
+    pkg_reader_t *reader;
     enum MHD_Result ret;
 
     if (strncmp(url, prefix, strlen(prefix)))
@@ -319,9 +362,21 @@ queue_pkg_file(struct MHD_Connection *conn, const char *url) {
     }
     record_pkg_diag(url, range, status, start, end, total);
 
-    resp = MHD_create_response_from_fd_at_offset64(send_size, fd, start);
+    reader = calloc(1, sizeof(*reader));
+    if (!reader) {
+        close(fd);
+        return queue_text(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "oom");
+    }
+    reader->fd    = fd;
+    reader->start = start;
+    reader->size  = send_size;
+
+    resp = MHD_create_response_from_callback(send_size, 65536,
+                                             pkg_reader_cb, reader,
+                                             pkg_reader_free);
     if (!resp) {
         close(fd);
+        free(reader);
         return MHD_NO;
     }
     MHD_add_response_header(resp, MHD_HTTP_HEADER_ACCESS_CONTROL_ALLOW_ORIGIN, "*");
@@ -336,22 +391,37 @@ queue_pkg_file(struct MHD_Connection *conn, const char *url) {
         MHD_add_response_header(resp, MHD_HTTP_HEADER_CONTENT_RANGE, content_range);
     }
     ret = MHD_queue_response(conn, status, resp);
-    MHD_destroy_response(resp); /* closes fd */
+    MHD_destroy_response(resp); /* pkg_reader_free closes fd */
     return ret;
 }
 
 /* ---------- status JSON ------------------------------------------------- */
 
-static void
-rebuild_status_json(void) {
-    snprintf(g_status_json, sizeof(g_status_json),
+/* Free space on the download partition, in MB. Best-effort: 0 if unavailable. */
+static long long
+data_free_mb(void) {
+    struct statvfs vfs;
+    if (statvfs(PATCHDL_DL_DIR, &vfs) == 0 || statvfs("/data", &vfs) == 0)
+        return (long long)(((unsigned long long)vfs.f_bavail *
+                            (unsigned long long)vfs.f_frsize) / (1024ULL * 1024ULL));
+    return 0;
+}
+
+/* Built fresh per request so free space stays live (a 60+ GB download moves
+   it a lot). g_fw is read-only after startup, so this is thread-safe. */
+static char *
+build_status_json(void) {
+    char *out = malloc(512);
+    if (!out) return NULL;
+    snprintf(out, 512,
              "{\"firmware\":\"%s\","
              "\"firmware_build\":\"0x%08x\","
              "\"dns_guard\":\"Active\","
              "\"resolver\":\"Internal allowlist\","
-             "\"free_space_mb\":0,"
+             "\"free_space_mb\":%lld,"
              "\"download_dir\":\"/data/patchdl (internal)\"}",
-             g_fw.str, g_fw.bin);
+             g_fw.str, g_fw.bin, data_free_mb());
+    return out;
 }
 
 /* ---------- config persistence (/data/patchdl/config.json) -------------- */
@@ -518,6 +588,45 @@ build_titles_json(void) {
     return j.buf; /* caller owns; use queue_json_owned */
 }
 
+static char *
+build_downloads_json(void) {
+    jbuf_t j = {0};
+    long long downloaded, total;
+    int progress = 0;
+    char detail[128];
+
+    pthread_mutex_lock(&g_mutex);
+    jbuf_append(&j, "[");
+    if (g_dl.active) {
+        downloaded = g_dl.downloaded;
+        total = g_dl.total;
+        if (total > 0 && downloaded >= 0)
+            progress = (int)((downloaded * 100) / total);
+        if (progress < 0) progress = 0;
+        if (progress > 100) progress = 100;
+        if (total > 0)
+            snprintf(detail, sizeof(detail), "%.1f GB of %.1f GB",
+                     downloaded / 1073741824.0, total / 1073741824.0);
+        else
+            snprintf(detail, sizeof(detail), "%.1f MB downloaded",
+                     downloaded / 1048576.0);
+
+        jbuf_append(&j, "{");
+        jbuf_append(&j, "\"title_id\":"); jbuf_append_str(&j, g_dl.title_id);
+        jbuf_append(&j, ",\"name\":");    jbuf_append_str(&j, g_dl.name);
+        jbuf_append(&j, ",\"version\":"); jbuf_append_str(&j, g_dl.version);
+        jbuf_appendf(&j, ",\"progress\":%d", progress);
+        jbuf_append(&j, ",\"detail\":");  jbuf_append_str(&j, detail);
+        jbuf_appendf(&j, ",\"bytes\":%lld,\"total_bytes\":%lld",
+                     downloaded, total);
+        jbuf_append(&j, ",\"path\":");    jbuf_append_str(&j, g_dl.path);
+        jbuf_append(&j, "}");
+    }
+    jbuf_append(&j, "]");
+    pthread_mutex_unlock(&g_mutex);
+    return j.buf;
+}
+
 /* ---------- verxml background fetch ------------------------------------ */
 
 /* Remove a downloaded patch once the game is at/past that version, i.e. the
@@ -585,7 +694,10 @@ get_title_action_info(const char *title_id, patchdl_source_t *src,
                       char *patch_url, size_t url_sz,
                       char *patch_title_id, size_t pt_sz,
                       char *patch_storage_title_id, size_t pst_sz,
-                      char *content_id, size_t ci_sz, int *enabled) {
+                      char *content_id, size_t ci_sz,
+                      char *name, size_t name_sz,
+                      char *version, size_t ver_sz,
+                      int *enabled) {
     int found = 0;
 
     pthread_mutex_lock(&g_mutex);
@@ -600,6 +712,10 @@ get_title_action_info(const char *title_id, patchdl_source_t *src,
             patch_storage_title_id[pst_sz - 1] = '\0';
             strncpy(content_id, g_titles[i].content_id, ci_sz - 1);
             content_id[ci_sz - 1] = '\0';
+            strncpy(name, g_titles[i].name, name_sz - 1);
+            name[name_sz - 1] = '\0';
+            strncpy(version, g_titles[i].compatible_version, ver_sz - 1);
+            version[ver_sz - 1] = '\0';
             *enabled = g_titles[i].enabled;
             found = 1;
             break;
@@ -637,13 +753,86 @@ static void
 title_pkg_path(const char *title_id, const char *patch_url,
                char *out, size_t out_sz) {
     const char *base = strrchr(patch_url, '/');
+    char name[192];
+    size_t n;
+
     base = base ? base + 1 : "patch.pkg";
-    snprintf(out, out_sz, "%s/%s/%s", PATCHDL_DL_DIR, title_id, base);
+    snprintf(name, sizeof(name), "%s", base);
+    n = strlen(name);
+    if (n > 5 && !strcmp(name + n - 5, ".json"))
+        snprintf(name + n - 5, sizeof(name) - (n - 5), ".pkg");
+    snprintf(out, out_sz, "%s/%s/%s", PATCHDL_DL_DIR, title_id, name);
+}
+
+static int
+url_is_manifest(const char *url) {
+    size_t n = url ? strlen(url) : 0;
+    return n > 5 && !strcmp(url + n - 5, ".json");
+}
+
+/* Returns non-zero to abort the download when a cancel has been requested. */
+static int
+download_progress_cb(void *ctx, long long downloaded, long long total) {
+    int cancel;
+    (void)ctx;
+    pthread_mutex_lock(&g_mutex);
+    if (g_dl.active) {
+        g_dl.downloaded = downloaded;
+        g_dl.total = total;
+    }
+    cancel = g_dl.cancel;
+    pthread_mutex_unlock(&g_mutex);
+    return cancel;
+}
+
+/* Delete a title's internal download directory and its contents (a partial or
+   a finished package). Best-effort; only ever touches /data/patchdl. */
+static void
+remove_title_dir(const char *title_id) {
+    char           dir[288], path[560];
+    DIR           *d;
+    struct dirent *e;
+
+    snprintf(dir, sizeof(dir), "%s/%s", PATCHDL_DL_DIR, title_id);
+    if ((d = opendir(dir))) {
+        while ((e = readdir(d))) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+                continue;
+            snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+            unlink(path);
+        }
+        closedir(d);
+    }
+    rmdir(dir);
+}
+
+/* Cancel an in-progress download for this title (the worker aborts and removes
+   the partial), or delete an already-downloaded package if nothing is running. */
+static enum MHD_Result
+do_cancel(struct MHD_Connection *conn, const char *title_id) {
+    char resp[96];
+    int  was_active = 0;
+
+    pthread_mutex_lock(&g_mutex);
+    if (g_dl.active && !strcmp(g_dl.title_id, title_id)) {
+        g_dl.cancel = 1;
+        was_active = 1;
+    }
+    pthread_mutex_unlock(&g_mutex);
+
+    if (!was_active)
+        remove_title_dir(title_id);
+
+    snprintf(resp, sizeof(resp),
+             "{\"ok\":true,\"cancelled\":%s,\"deleted\":true}",
+             was_active ? "true" : "false");
+    return queue_json_owned(conn, MHD_HTTP_OK, strdup(resp));
 }
 
 static enum MHD_Result
 do_download(struct MHD_Connection *conn, const char *title_id,
-            patchdl_source_t src, const char *patch_url, int enabled) {
+            patchdl_source_t src, const char *patch_url,
+            const char *name, const char *version, int enabled) {
     char        dir[256], dest[320], resp[640];
     long long   bytes = 0;
 
@@ -665,11 +854,51 @@ do_download(struct MHD_Connection *conn, const char *title_id,
     mkdir(dir, 0777);
     title_pkg_path(title_id, patch_url, dest, sizeof(dest));
 
-    if (patchdl_http_download(patch_url, dest, &bytes)) {
+    pthread_mutex_lock(&g_mutex);
+    if (g_dl.active) {
+        pthread_mutex_unlock(&g_mutex);
+        return queue_json(conn, MHD_HTTP_CONFLICT,
+                          "{\"ok\":false,\"reason\":\"download_in_progress\"}");
+    }
+    memset(&g_dl, 0, sizeof(g_dl));
+    g_dl.active = 1;
+    strncpy(g_dl.title_id, title_id, sizeof(g_dl.title_id) - 1);
+    strncpy(g_dl.name, name && name[0] ? name : title_id, sizeof(g_dl.name) - 1);
+    strncpy(g_dl.version, version ? version : "", sizeof(g_dl.version) - 1);
+    strncpy(g_dl.path, dest, sizeof(g_dl.path) - 1);
+    pthread_mutex_unlock(&g_mutex);
+
+    if ((url_is_manifest(patch_url)
+            ? patchdl_http_download_manifest_progress(patch_url, dest, &bytes,
+                                                      download_progress_cb, NULL)
+            : patchdl_http_download_progress(patch_url, dest, &bytes,
+                                             download_progress_cb, NULL))) {
+        int was_cancel;
+        pthread_mutex_lock(&g_mutex);
+        was_cancel = g_dl.cancel;
+        g_dl.active = 0;
+        g_dl.cancel = 0;
+        pthread_mutex_unlock(&g_mutex);
+
+        /* The download function already unlinked the partial file on failure;
+           drop the now-empty title dir too. */
+        unlink(dest);
+        rmdir(dir);
+
+        if (was_cancel)
+            return queue_json(conn, MHD_HTTP_OK,
+                              "{\"ok\":false,\"cancelled\":true,"
+                              "\"reason\":\"download_cancelled\"}");
         snprintf(resp, sizeof(resp),
                  "{\"ok\":false,\"reason\":\"download_failed\"}");
         return queue_json_owned(conn, MHD_HTTP_BAD_GATEWAY, strdup(resp));
     }
+
+    pthread_mutex_lock(&g_mutex);
+    g_dl.downloaded = bytes;
+    g_dl.total = bytes;
+    g_dl.active = 0;
+    pthread_mutex_unlock(&g_mutex);
 
     /* shadowmount: download allowed, install is not (per source policy). */
     snprintf(resp, sizeof(resp),
@@ -757,6 +986,8 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
     char             patch_title_id[16] = {0};
     char             patch_storage_title_id[16] = {0};
     char             content_id[64] = {0};
+    char             name[128] = {0};
+    char             version[16] = {0};
     int              enabled = 0;
     patchdl_source_t src = PATCHDL_SOURCE_UNKNOWN;
 
@@ -768,7 +999,10 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
                                patch_title_id, sizeof(patch_title_id),
                                patch_storage_title_id,
                                sizeof(patch_storage_title_id),
-                               content_id, sizeof(content_id), &enabled))
+                               content_id, sizeof(content_id),
+                               name, sizeof(name),
+                               version, sizeof(version),
+                               &enabled))
         return queue_text(conn, MHD_HTTP_NOT_FOUND, "unknown title");
 
     if (!strcmp(action, "enable"))
@@ -778,7 +1012,10 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
         return set_title_enabled(conn, title_id, 0);
 
     if (!strcmp(action, "download"))
-        return do_download(conn, title_id, src, patch_url, enabled);
+        return do_download(conn, title_id, src, patch_url, name, version, enabled);
+
+    if (!strcmp(action, "cancel"))
+        return do_cancel(conn, title_id);
 
     if (!strcmp(action, "check"))
         return queue_json(conn, MHD_HTTP_ACCEPTED,
@@ -878,7 +1115,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         return queue_text(conn, MHD_HTTP_METHOD_NOT_ALLOWED, "method not allowed");
 
     if (!strcmp(url, "/api/status"))
-        return queue_json(conn, MHD_HTTP_OK, g_status_json);
+        return queue_json_owned(conn, MHD_HTTP_OK, build_status_json());
 
     if (!strcmp(url, "/api/config"))
         return queue_json_owned(conn, MHD_HTTP_OK, build_config_json());
@@ -887,7 +1124,7 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         return queue_json_owned(conn, MHD_HTTP_OK, build_titles_json());
 
     if (!strcmp(url, "/api/downloads"))
-        return queue_json(conn, MHD_HTTP_OK, downloads_json);
+        return queue_json_owned(conn, MHD_HTTP_OK, build_downloads_json());
 
     if (!strcmp(url, "/api/debug"))
         return queue_json(conn, MHD_HTTP_OK,
@@ -941,7 +1178,6 @@ patchdl_websrv_start(unsigned short port) {
     /* Collect real FW version and installed titles synchronously.
        The web UI is reachable only after this completes. */
     patchdl_fw_get(&g_fw);
-    rebuild_status_json();
 
     if (patchdl_scan(&g_titles, &g_title_count))
         g_title_count = 0;
