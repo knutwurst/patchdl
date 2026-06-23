@@ -2,48 +2,34 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>PatchDL</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <svg class="icon-sprite" aria-hidden="true">
-      <symbol id="icon-shield" viewBox="0 0 24 24">
-        <path d="M12 3l7 3v5c0 5-3 8-7 10-4-2-7-5-7-10V6l7-3z" />
-        <path d="M9 12l2 2 4-5" />
-      </symbol>
       <symbol id="icon-download" viewBox="0 0 24 24">
-        <path d="M12 3v11" />
-        <path d="M7 10l5 5 5-5" />
-        <path d="M5 20h14" />
+        <path d="M12 3v11" /><path d="M7 10l5 5 5-5" /><path d="M5 20h14" />
       </symbol>
       <symbol id="icon-refresh" viewBox="0 0 24 24">
-        <path d="M20 6v6h-6" />
-        <path d="M4 18v-6h6" />
-        <path d="M19 12A7 7 0 0 0 7 7" />
-        <path d="M5 12a7 7 0 0 0 12 5" />
+        <path d="M20 6v6h-6" /><path d="M4 18v-6h6" />
+        <path d="M19 12A7 7 0 0 0 7 7" /><path d="M5 12a7 7 0 0 0 12 5" />
       </symbol>
       <symbol id="icon-settings" viewBox="0 0 24 24">
         <path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" />
         <path d="M4 12h2M18 12h2M12 4v2M12 18v2M6.5 6.5 8 8M16 16l1.5 1.5M17.5 6.5 16 8M8 16l-1.5 1.5" />
       </symbol>
       <symbol id="icon-search" viewBox="0 0 24 24">
-        <path d="M10.5 18a7.5 7.5 0 1 1 0-15 7.5 7.5 0 0 1 0 15z" />
-        <path d="M16 16l5 5" />
+        <path d="M10.5 18a7.5 7.5 0 1 1 0-15 7.5 7.5 0 0 1 0 15z" /><path d="M16 16l5 5" />
       </symbol>
       <symbol id="icon-save" viewBox="0 0 24 24">
-        <path d="M5 4h12l2 2v14H5V4z" />
-        <path d="M8 4v6h8V4" />
-        <path d="M8 20v-6h8v6" />
-      </symbol>
-      <symbol id="icon-pause" viewBox="0 0 24 24">
-        <path d="M8 5v14" />
-        <path d="M16 5v14" />
+        <path d="M5 4h12l2 2v14H5V4z" /><path d="M8 4v6h8V4" /><path d="M8 20v-6h8v6" />
       </symbol>
       <symbol id="icon-log" viewBox="0 0 24 24">
-        <path d="M7 4h10l3 3v13H7V4z" />
-        <path d="M17 4v4h4" />
-        <path d="M10 12h7M10 16h5" />
+        <path d="M7 4h10l3 3v13H7V4z" /><path d="M17 4v4h4" /><path d="M10 12h7M10 16h5" />
+      </symbol>
+      <symbol id="icon-grid" viewBox="0 0 24 24">
+        <path d="M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z" />
       </symbol>
     </svg>
 
@@ -57,107 +43,95 @@
           </div>
         </div>
 
-        <nav class="nav-list">
-          <a class="nav-link is-active" href="#games">
-            <svg><use href="#icon-download"></use></svg>
-            Games
-          </a>
-          <a class="nav-link" href="#downloads">
-            <svg><use href="#icon-refresh"></use></svg>
-            Queue
-          </a>
-          <a class="nav-link" href="#settings">
-            <svg><use href="#icon-settings"></use></svg>
-            Settings
-          </a>
-          <a class="nav-link" href="#logs">
-            <svg><use href="#icon-log"></use></svg>
-            Logs
-          </a>
+        <nav class="nav-list" aria-label="Sections">
+          <button class="nav-link is-active" data-view="games" aria-label="Games" aria-current="page">
+            <svg><use href="#icon-grid"></use></svg><span>Games</span>
+          </button>
+          <button class="nav-link" data-view="settings" aria-label="Settings">
+            <svg><use href="#icon-settings"></use></svg><span>Settings</span>
+          </button>
+          <button class="nav-link" data-view="logs" aria-label="Logs">
+            <svg><use href="#icon-log"></use></svg><span>Logs</span>
+          </button>
         </nav>
+
+        <div class="rail-foot">
+          <span id="railFw">FW --</span>
+          <span id="railSpace">-- free</span>
+        </div>
       </aside>
 
       <main class="main">
-        <header class="topbar">
-          <div>
-            <p class="eyebrow">Standalone ELF Web UI</p>
-            <h1>Controlled game patch downloads</h1>
-          </div>
-          <div class="topbar-actions">
-            <button class="icon-button" id="refreshBtn" title="Refresh status and games">
-              <svg><use href="#icon-refresh"></use></svg>
-            </button>
-            <button class="primary-button" id="saveBtn">
-              <svg><use href="#icon-save"></use></svg>
-              Save
-            </button>
-          </div>
-        </header>
-
-        <section class="status-strip" aria-label="System status">
-          <article class="metric">
-            <span>Firmware</span>
-            <strong id="firmwareValue">--</strong>
-            <em id="firmwareBuild">System version</em>
-          </article>
-          <article class="metric">
-            <span>DNS Guard</span>
-            <strong id="dnsValue">--</strong>
-            <em>Sony blocked by nanoDNS</em>
-          </article>
-          <article class="metric">
-            <span>CDN Access</span>
-            <strong id="resolverValue">--</strong>
-            <em>PatchDL resolver only</em>
-          </article>
-          <article class="metric">
-            <span>Storage</span>
-            <strong id="spaceValue">--</strong>
-            <em id="downloadDirValue">Download target</em>
-          </article>
-        </section>
-
-        <section class="toolbar" id="games">
-          <div class="search-box">
-            <svg><use href="#icon-search"></use></svg>
-            <input id="searchInput" type="search" placeholder="Search title, Title ID, or Content ID" />
-          </div>
-
-          <div class="segmented" role="tablist" aria-label="Filter">
-            <button class="is-selected" data-filter="all">All</button>
-            <button data-filter="updatable">Updatable</button>
-            <button data-filter="uptodate">Up to date</button>
-            <button data-filter="needsfw">Needs FW</button>
-            <button data-filter="blocked">Can't update</button>
-            <button data-filter="queued">Queue</button>
-          </div>
-        </section>
-
-        <section class="game-grid" id="gameGrid" aria-live="polite"></section>
-
-        <section class="split-band">
-          <div class="panel" id="downloads">
-            <div class="panel-heading">
-              <div>
-                <p class="eyebrow">Downloads</p>
-                <h2>Active Queue</h2>
-              </div>
-              <button class="ghost-button" id="pauseAllBtn">
-                <svg><use href="#icon-pause"></use></svg>
-                Pause
+        <!-- ============ GAMES ============ -->
+        <section class="view is-active" data-view="games">
+          <header class="topbar">
+            <div>
+              <p class="eyebrow">Standalone ELF Web UI</p>
+              <h1>Games</h1>
+            </div>
+            <div class="topbar-actions">
+              <button class="icon-button" id="refreshBtn" title="Refresh status and games" aria-label="Refresh">
+                <svg><use href="#icon-refresh"></use></svg>
               </button>
             </div>
-            <div class="queue-list" id="queueList"></div>
+          </header>
+
+          <section class="status-strip" aria-label="System status">
+            <article class="metric">
+              <span>Firmware</span>
+              <strong id="firmwareValue">--</strong>
+              <em id="firmwareBuild">System version</em>
+            </article>
+            <article class="metric">
+              <span>DNS Guard</span>
+              <strong id="dnsValue">--</strong>
+              <em>Sony blocked by nanoDNS</em>
+            </article>
+            <article class="metric">
+              <span>CDN Access</span>
+              <strong id="resolverValue">--</strong>
+              <em>PatchDL resolver only</em>
+            </article>
+            <article class="metric">
+              <span>Storage</span>
+              <strong id="spaceValue">--</strong>
+              <em id="downloadDirValue">Download target</em>
+            </article>
+          </section>
+
+          <div class="toolbar">
+            <div class="search-box">
+              <svg><use href="#icon-search"></use></svg>
+              <input id="searchInput" type="search" placeholder="Search title, Title ID, or Content ID" />
+            </div>
+            <div class="segmented" role="group" aria-label="Filter">
+              <button class="is-selected" data-filter="all" aria-pressed="true">All</button>
+              <button data-filter="updatable" aria-pressed="false">Updatable</button>
+              <button data-filter="uptodate" aria-pressed="false">Up to date</button>
+              <button data-filter="needsfw" aria-pressed="false">Needs FW</button>
+              <button data-filter="blocked" aria-pressed="false">Can't update</button>
+            </div>
           </div>
 
-          <div class="panel" id="settings">
-            <div class="panel-heading">
-              <div>
-                <p class="eyebrow">Policy</p>
-                <h2>Update Rules</h2>
-              </div>
-            </div>
+          <section class="game-grid" id="gameGrid"></section>
+        </section>
 
+        <!-- ============ SETTINGS ============ -->
+        <section class="view" data-view="settings">
+          <header class="topbar">
+            <div>
+              <p class="eyebrow">Policy</p>
+              <h1>Settings</h1>
+            </div>
+            <div class="topbar-actions">
+              <button class="primary-button" id="saveBtn">
+                <svg><use href="#icon-save"></use></svg>
+                Save
+              </button>
+            </div>
+          </header>
+
+          <div class="panel">
             <div class="settings-grid">
               <label class="field">
                 <span>Default Policy</span>
@@ -168,27 +142,48 @@
               </label>
               <label class="field">
                 <span>Download Folder</span>
-                <input id="downloadDir" type="text" spellcheck="false" readonly title="Patches always download internally and are removed after install" />
+                <input id="downloadDir" type="text" spellcheck="false" readonly
+                       title="Patches always download internally and are removed after install" />
               </label>
+
               <label class="switch-row">
-                <input id="installAfterDownload" type="checkbox" />
                 <span>
                   <strong>Install after download</strong>
                   <em>Global default, overridable per game</em>
                 </span>
+                <span class="toggle">
+                  <input id="installAfterDownload" type="checkbox" aria-label="Install after download" />
+                  <span class="track"></span>
+                </span>
               </label>
               <label class="switch-row">
-                <input id="deleteAfterInstall" type="checkbox" />
                 <span>
                   <strong>Delete PKG after install</strong>
                   <em>Only after a successful install</em>
                 </span>
+                <span class="toggle">
+                  <input id="deleteAfterInstall" type="checkbox" aria-label="Delete package after install" />
+                  <span class="track"></span>
+                </span>
               </label>
               <label class="switch-row">
-                <input id="verifyDownloads" type="checkbox" />
                 <span>
                   <strong>Verify downloaded pieces (SHA-256)</strong>
                   <em>Checks each manifest piece; off by default, verify on-device first</em>
+                </span>
+                <span class="toggle">
+                  <input id="verifyDownloads" type="checkbox" aria-label="Verify downloaded pieces" />
+                  <span class="track"></span>
+                </span>
+              </label>
+              <label class="switch-row">
+                <span>
+                  <strong>Home-screen shortcut</strong>
+                  <em id="shortcutHint">Add a PS5 home-screen icon that opens this UI in the browser</em>
+                </span>
+                <span class="toggle">
+                  <input id="homeShortcut" type="checkbox" aria-label="Install home-screen shortcut" />
+                  <span class="track"></span>
                 </span>
               </label>
             </div>
@@ -205,13 +200,19 @@
           </div>
         </section>
 
-        <section class="log-panel" id="logs">
-          <div class="panel-heading">
+        <!-- ============ LOGS ============ -->
+        <section class="view" data-view="logs">
+          <header class="topbar">
             <div>
               <p class="eyebrow">Runtime</p>
-              <h2>Recent Events</h2>
+              <h1>Logs</h1>
             </div>
-          </div>
+            <div class="topbar-actions">
+              <button class="icon-button" id="clearLogBtn" title="Clear log" aria-label="Clear log">
+                <svg><use href="#icon-log"></use></svg>
+              </button>
+            </div>
+          </header>
           <pre id="logOutput" tabindex="0"></pre>
         </section>
       </main>

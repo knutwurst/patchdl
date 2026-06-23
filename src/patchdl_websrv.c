@@ -38,7 +38,8 @@ static struct {
     int  install_after_download;
     int  delete_pkg_after_install;
     int  verify_downloads;         /* SHA-256 each manifest piece (default off) */
-} g_cfg = { "deny", 0, 1, 0 };
+    int  home_shortcut;            /* user wants a home-screen browser tile */
+} g_cfg = { "deny", 0, 1, 0, 1 };
 
 static struct {
     int       active;
@@ -438,11 +439,13 @@ build_config_json(void) {
              "{\"default_policy\":\"%s\","
              "\"install_after_download\":%s,"
              "\"delete_pkg_after_install\":%s,"
-             "\"verify_downloads\":%s,",
+             "\"verify_downloads\":%s,"
+             "\"home_shortcut\":%s,",
              g_cfg.default_policy[0] ? g_cfg.default_policy : "deny",
              g_cfg.install_after_download ? "true" : "false",
              g_cfg.delete_pkg_after_install ? "true" : "false",
-             g_cfg.verify_downloads ? "true" : "false");
+             g_cfg.verify_downloads ? "true" : "false",
+             g_cfg.home_shortcut ? "true" : "false");
     pthread_mutex_unlock(&g_mutex);
 
     char *out = malloc(strlen(head) + sizeof(config_tail_json));
@@ -467,11 +470,13 @@ save_config(void) {
             "{\n\"default_policy\":\"%s\",\n"
             "\"install_after_download\":%s,\n"
             "\"delete_pkg_after_install\":%s,\n"
-            "\"verify_downloads\":%s,\n\"titles\":{",
+            "\"verify_downloads\":%s,\n"
+            "\"home_shortcut\":%s,\n\"titles\":{",
             g_cfg.default_policy[0] ? g_cfg.default_policy : "deny",
             g_cfg.install_after_download ? "true" : "false",
             g_cfg.delete_pkg_after_install ? "true" : "false",
-            g_cfg.verify_downloads ? "true" : "false");
+            g_cfg.verify_downloads ? "true" : "false",
+            g_cfg.home_shortcut ? "true" : "false");
     for (size_t i = 0; i < g_title_count; i++)
         fprintf(f, "%s\"%s\":%s", i ? "," : "",
                 g_titles[i].title_id, g_titles[i].enabled ? "true" : "false");
@@ -507,6 +512,8 @@ load_config(void) {
         json_get_bool(buf, "delete_pkg_after_install", g_cfg.delete_pkg_after_install);
     g_cfg.verify_downloads =
         json_get_bool(buf, "verify_downloads", g_cfg.verify_downloads);
+    g_cfg.home_shortcut =
+        json_get_bool(buf, "home_shortcut", g_cfg.home_shortcut);
 
     /* per-title overrides live under "titles": { "<id>": true|false, ... } */
     const char *titles = strstr(buf, "\"titles\"");
@@ -1093,6 +1100,8 @@ handle_config_post(struct MHD_Connection *conn, const char *body) {
         json_get_bool(body, "delete_pkg_after_install", g_cfg.delete_pkg_after_install);
     g_cfg.verify_downloads =
         json_get_bool(body, "verify_downloads", g_cfg.verify_downloads);
+    g_cfg.home_shortcut =
+        json_get_bool(body, "home_shortcut", g_cfg.home_shortcut);
     pthread_mutex_unlock(&g_mutex);
 
     save_config();
