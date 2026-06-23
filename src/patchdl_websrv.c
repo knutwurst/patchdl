@@ -37,7 +37,8 @@ static struct {
     char default_policy[8];        /* "deny" | "allow" */
     int  install_after_download;
     int  delete_pkg_after_install;
-} g_cfg = { "deny", 0, 1 };
+    int  verify_downloads;         /* SHA-256 each manifest piece (default off) */
+} g_cfg = { "deny", 0, 1, 0 };
 
 static struct {
     int       active;
@@ -436,10 +437,12 @@ build_config_json(void) {
     snprintf(head, sizeof(head),
              "{\"default_policy\":\"%s\","
              "\"install_after_download\":%s,"
-             "\"delete_pkg_after_install\":%s,",
+             "\"delete_pkg_after_install\":%s,"
+             "\"verify_downloads\":%s,",
              g_cfg.default_policy[0] ? g_cfg.default_policy : "deny",
              g_cfg.install_after_download ? "true" : "false",
-             g_cfg.delete_pkg_after_install ? "true" : "false");
+             g_cfg.delete_pkg_after_install ? "true" : "false",
+             g_cfg.verify_downloads ? "true" : "false");
     pthread_mutex_unlock(&g_mutex);
 
     char *out = malloc(strlen(head) + sizeof(config_tail_json));
@@ -463,10 +466,12 @@ save_config(void) {
     fprintf(f,
             "{\n\"default_policy\":\"%s\",\n"
             "\"install_after_download\":%s,\n"
-            "\"delete_pkg_after_install\":%s,\n\"titles\":{",
+            "\"delete_pkg_after_install\":%s,\n"
+            "\"verify_downloads\":%s,\n\"titles\":{",
             g_cfg.default_policy[0] ? g_cfg.default_policy : "deny",
             g_cfg.install_after_download ? "true" : "false",
-            g_cfg.delete_pkg_after_install ? "true" : "false");
+            g_cfg.delete_pkg_after_install ? "true" : "false",
+            g_cfg.verify_downloads ? "true" : "false");
     for (size_t i = 0; i < g_title_count; i++)
         fprintf(f, "%s\"%s\":%s", i ? "," : "",
                 g_titles[i].title_id, g_titles[i].enabled ? "true" : "false");
@@ -500,6 +505,8 @@ load_config(void) {
         json_get_bool(buf, "install_after_download", g_cfg.install_after_download);
     g_cfg.delete_pkg_after_install =
         json_get_bool(buf, "delete_pkg_after_install", g_cfg.delete_pkg_after_install);
+    g_cfg.verify_downloads =
+        json_get_bool(buf, "verify_downloads", g_cfg.verify_downloads);
 
     /* per-title overrides live under "titles": { "<id>": true|false, ... } */
     const char *titles = strstr(buf, "\"titles\"");
@@ -835,6 +842,7 @@ do_download(struct MHD_Connection *conn, const char *title_id,
             const char *name, const char *version, int enabled) {
     char        dir[256], dest[320], resp[640];
     long long   bytes = 0;
+    int         verify = 0, dlrc;
 
     if (!enabled)
         return queue_json(conn, MHD_HTTP_FORBIDDEN,
@@ -866,13 +874,15 @@ do_download(struct MHD_Connection *conn, const char *title_id,
     strncpy(g_dl.name, name && name[0] ? name : title_id, sizeof(g_dl.name) - 1);
     strncpy(g_dl.version, version ? version : "", sizeof(g_dl.version) - 1);
     strncpy(g_dl.path, dest, sizeof(g_dl.path) - 1);
+    verify = g_cfg.verify_downloads;
     pthread_mutex_unlock(&g_mutex);
 
-    if ((url_is_manifest(patch_url)
-            ? patchdl_http_download_manifest_progress(patch_url, dest, &bytes,
-                                                      download_progress_cb, NULL)
-            : patchdl_http_download_progress(patch_url, dest, &bytes,
-                                             download_progress_cb, NULL))) {
+    dlrc = url_is_manifest(patch_url)
+        ? patchdl_http_download_manifest_progress(patch_url, dest, &bytes,
+                                                  download_progress_cb, NULL, verify)
+        : patchdl_http_download_progress(patch_url, dest, &bytes,
+                                         download_progress_cb, NULL);
+    if (dlrc) {
         int was_cancel;
         pthread_mutex_lock(&g_mutex);
         was_cancel = g_dl.cancel;
@@ -889,8 +899,9 @@ do_download(struct MHD_Connection *conn, const char *title_id,
             return queue_json(conn, MHD_HTTP_OK,
                               "{\"ok\":false,\"cancelled\":true,"
                               "\"reason\":\"download_cancelled\"}");
-        snprintf(resp, sizeof(resp),
-                 "{\"ok\":false,\"reason\":\"download_failed\"}");
+        /* -2 = a piece failed its SHA-256 (only possible when verify is on). */
+        snprintf(resp, sizeof(resp), "{\"ok\":false,\"reason\":\"%s\"}",
+                 dlrc == -2 ? "piece_verify_failed" : "download_failed");
         return queue_json_owned(conn, MHD_HTTP_BAD_GATEWAY, strdup(resp));
     }
 
@@ -1064,6 +1075,8 @@ handle_config_post(struct MHD_Connection *conn, const char *body) {
         json_get_bool(body, "install_after_download", g_cfg.install_after_download);
     g_cfg.delete_pkg_after_install =
         json_get_bool(body, "delete_pkg_after_install", g_cfg.delete_pkg_after_install);
+    g_cfg.verify_downloads =
+        json_get_bool(body, "verify_downloads", g_cfg.verify_downloads);
     pthread_mutex_unlock(&g_mutex);
 
     save_config();

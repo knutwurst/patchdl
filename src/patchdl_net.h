@@ -28,14 +28,15 @@ int patchdl_http_download_progress(const char *url, const char *dest_path,
                                    patchdl_download_progress_cb cb, void *ctx);
 
 /* Download a Sony JSON package manifest by concatenating every entry in
-   "pieces" into one installable PKG. */
+   "pieces" into one installable PKG. When `verify` is non-zero each piece is
+   checked against its manifest SHA-256 (a mismatch returns -2). */
 int patchdl_http_download_manifest(const char *manifest_url, const char *dest_path,
                                    long long *bytes_out);
 int patchdl_http_download_manifest_progress(const char *manifest_url,
                                             const char *dest_path,
                                             long long *bytes_out,
                                             patchdl_download_progress_cb cb,
-                                            void *ctx);
+                                            void *ctx, int verify);
 
 /* Diagnostic: run the GET pipeline for `url` and write a JSON report
    (dns result/ip, curl code, http status, bytes) into `out_json`. */

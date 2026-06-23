@@ -47,6 +47,7 @@ const fallback = {
     download_dir: "/data/patchdl (internal)",
     install_after_download: false,
     delete_pkg_after_install: true,
+    verify_downloads: false,
     source_policy: {
       official: { allow_check: true, allow_download: true, allow_install: true },
       external: { allow_check: true, allow_download: true, allow_install: true },
@@ -168,6 +169,7 @@ function bindElements() {
     downloadDir: document.getElementById("downloadDir"),
     installAfterDownload: document.getElementById("installAfterDownload"),
     deleteAfterInstall: document.getElementById("deleteAfterInstall"),
+    verifyDownloads: document.getElementById("verifyDownloads"),
     refreshBtn: document.getElementById("refreshBtn"),
     saveBtn: document.getElementById("saveBtn"),
     pauseAllBtn: document.getElementById("pauseAllBtn"),
@@ -262,6 +264,8 @@ function renderSettings() {
   els.downloadDir.value = state.config.download_dir || "";
   els.installAfterDownload.checked = Boolean(state.config.install_after_download);
   els.deleteAfterInstall.checked = Boolean(state.config.delete_pkg_after_install);
+  if (els.verifyDownloads)
+    els.verifyDownloads.checked = Boolean(state.config.verify_downloads);
   els.allowlistHosts.replaceChildren(...(state.config.cdn_allowlist || []).map((host) => {
     const chip = document.createElement("span");
     chip.className = "host-chip";
@@ -573,6 +577,7 @@ async function saveConfig() {
     download_dir: els.downloadDir.value.trim(),
     install_after_download: els.installAfterDownload.checked,
     delete_pkg_after_install: els.deleteAfterInstall.checked,
+    verify_downloads: els.verifyDownloads ? els.verifyDownloads.checked : Boolean(state.config.verify_downloads),
   };
 
   try {
@@ -782,6 +787,7 @@ const REASON_TEXT = {
   no_compatible_patch: "No compatible patch available.",
   download_failed: "Download failed.",
   download_in_progress: "Another download is already running.",
+  piece_verify_failed: "A downloaded piece failed its SHA-256 check.",
 };
 function reasonText(error) {
   const r = error && error.body && error.body.reason;

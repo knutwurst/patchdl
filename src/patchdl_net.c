@@ -7,12 +7,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 
 #ifdef PATCHDL_HAVE_CURL
 #include <curl/curl.h>
+#include <openssl/evp.h>
 #include "patchdl_ca.h"
 #endif
 
@@ -290,9 +292,32 @@ patchdl_http_get(const char *url, patchdl_buf_t *out) {
     return 0;
 }
 
+/* Write sink: tees the body to the file and, when verifying, into a running
+   SHA-256. curl always calls with size==1, so nmemb is the byte count. */
+typedef struct {
+    FILE       *fp;
+    EVP_MD_CTX *md;   /* NULL when not verifying */
+} write_sink_t;
+
 static size_t
 file_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
-    return fwrite(ptr, size, nmemb, (FILE *)userdata);
+    write_sink_t *s = (write_sink_t *)userdata;
+    size_t written = fwrite(ptr, size, nmemb, s->fp);
+    if (s->md && written)
+        EVP_DigestUpdate(s->md, ptr, written * size);
+    return written;
+}
+
+/* Hex-encode a digest, lowercase. */
+static void
+hex_encode(const unsigned char *d, unsigned int len, char *out, size_t out_sz) {
+    static const char hexd[] = "0123456789abcdef";
+    unsigned int i;
+    for (i = 0; i < len && (2u * i + 2u) < out_sz; i++) {
+        out[2 * i]     = hexd[(d[i] >> 4) & 0xf];
+        out[2 * i + 1] = hexd[d[i] & 0xf];
+    }
+    out[2 * i] = '\0';
 }
 
 typedef struct {
@@ -318,20 +343,31 @@ curl_progress_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
     return p->cb(p->ctx, p->base + (long long)dlnow, total);
 }
 
+/* Returns 0 on success, -1 on download/network failure, -2 when an expected
+   SHA-256 was given and the downloaded bytes did not match it. */
 static int
 http_download_to_file_progress(const char *url, FILE *fp, long long *bytes_out,
-                               progress_state_t *progress) {
+                               progress_state_t *progress,
+                               const char *expected_sha256_hex) {
     CURL             *curl;
     CURLcode          res;
     char              host[256], ip[INET_ADDRSTRLEN], rs443[512], rs80[512];
     struct curl_slist *rl = NULL;
     struct curl_blob  ca_blob;
     curl_off_t        dl = 0;
+    write_sink_t      sink = { fp, NULL };
+    int               verify = (expected_sha256_hex && expected_sha256_hex[0]);
 
     if (bytes_out) *bytes_out = 0;
     if (url_host(url, host, sizeof(host))) return -1;
     if (!host_allowed(host)) return -1;
     if (dns_lookup(host, ip, sizeof(ip))) return -1;
+
+    if (verify) {
+        sink.md = EVP_MD_CTX_new();
+        if (sink.md)
+            EVP_DigestInit_ex(sink.md, EVP_sha256(), NULL);
+    }
 
     snprintf(rs443, sizeof(rs443), "%s:443:%s", host, ip);
     rl = curl_slist_append(NULL, rs443);
@@ -343,12 +379,16 @@ http_download_to_file_progress(const char *url, FILE *fp, long long *bytes_out,
     ca_blob.flags = CURL_BLOB_COPY;
 
     curl = curl_easy_init();
-    if (!curl) { curl_slist_free_all(rl); return -1; }
+    if (!curl) {
+        curl_slist_free_all(rl);
+        if (sink.md) EVP_MD_CTX_free(sink.md);
+        return -1;
+    }
 
     curl_easy_setopt(curl, CURLOPT_URL,             url);
     curl_easy_setopt(curl, CURLOPT_RESOLVE,         rl);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,   file_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA,       fp);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA,       &sink);
     curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB,     &ca_blob);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER,  1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST,  2L);
@@ -371,7 +411,22 @@ http_download_to_file_progress(const char *url, FILE *fp, long long *bytes_out,
     curl_easy_cleanup(curl);
     curl_slist_free_all(rl);
 
-    if (res != CURLE_OK) return -1;
+    if (res != CURLE_OK) {
+        if (sink.md) EVP_MD_CTX_free(sink.md);
+        return -1;
+    }
+
+    if (sink.md) {
+        unsigned char dig[EVP_MAX_MD_SIZE];
+        unsigned int  dlen = 0;
+        char          hex[2 * EVP_MAX_MD_SIZE + 1];
+        EVP_DigestFinal_ex(sink.md, dig, &dlen);
+        EVP_MD_CTX_free(sink.md);
+        hex_encode(dig, dlen, hex, sizeof(hex));
+        if (strcasecmp(hex, expected_sha256_hex) != 0)
+            return -2;          /* integrity mismatch */
+    }
+
     if (bytes_out) *bytes_out = (long long)dl;
     return 0;
 }
@@ -385,7 +440,7 @@ patchdl_http_download_progress(const char *url, const char *dest_path,
     int rc;
 
     if (!fp) return -1;
-    rc = http_download_to_file_progress(url, fp, bytes_out, &progress);
+    rc = http_download_to_file_progress(url, fp, bytes_out, &progress, NULL);
     fclose(fp);
 
     if (rc) {
@@ -449,7 +504,7 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
                                         const char *dest_path,
                                         long long *bytes_out,
                                         patchdl_download_progress_cb cb,
-                                        void *ctx) {
+                                        void *ctx, int verify) {
     patchdl_buf_t manifest;
     const char *pieces;
     const char *p;
@@ -486,10 +541,11 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
     p = pieces;
     while ((p = strstr(p, "\"url\"")) && (!pieces_end || p < pieces_end)) {
         char url[768];
+        char hash[80] = {0};
         long long got = 0;
         unsigned long long expected = 0;
         unsigned long long offset = 0;
-        int have_offset;
+        int have_offset, drc;
         const char *obj_end = strchr(p, '}');
         progress_state_t progress = {
             cb,
@@ -502,6 +558,8 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
             break;
         json_u64_after(p, "fileSize", &expected);
         have_offset = (json_u64_after(p, "fileOffset", &offset) == 0);
+        if (verify)
+            json_string_after(p, "hashValue", hash, sizeof(hash));
 
         /* Pieces are concatenated in array order; each one's fileOffset must
            equal the bytes written so far. A manifest that lists them out of
@@ -509,8 +567,13 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
         if (have_offset && offset != (unsigned long long)total)
             goto done;
 
-        if (http_download_to_file_progress(url, fp, &got, &progress))
-            goto done;                 /* network error or cancel mid-piece */
+        /* drc: 0 ok, -1 network/cancel, -2 SHA-256 mismatch (propagated out). */
+        drc = http_download_to_file_progress(url, fp, &got, &progress,
+                                             hash[0] ? hash : NULL);
+        if (drc) {
+            if (drc == -2) rc = -2;
+            goto done;
+        }
         if (expected && (unsigned long long)got != expected)
             goto done;
 
@@ -538,7 +601,7 @@ int
 patchdl_http_download_manifest(const char *manifest_url, const char *dest_path,
                                long long *bytes_out) {
     return patchdl_http_download_manifest_progress(manifest_url, dest_path,
-                                                  bytes_out, NULL, NULL);
+                                                  bytes_out, NULL, NULL, 0);
 }
 
 void
@@ -633,8 +696,8 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
                                         const char *dest_path,
                                         long long *bytes_out,
                                         patchdl_download_progress_cb cb,
-                                        void *ctx) {
-    (void)cb; (void)ctx;
+                                        void *ctx, int verify) {
+    (void)cb; (void)ctx; (void)verify;
     return patchdl_http_download_manifest(manifest_url, dest_path, bytes_out);
 }
 
