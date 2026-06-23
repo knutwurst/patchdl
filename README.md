@@ -68,3 +68,40 @@ argv:
 ```sh
 patchdl-ps5.elf 12881
 ```
+
+## Building
+
+PatchDL builds against `ps5-payload-dev/sdk` and reuses etaHEN's checked-in
+`libmicrohttpd.a` plus header files. By default, the Makefile expects etaHEN's
+source tree next to this repository:
+
+```text
+../Source Code/include
+../Source Code/lib
+```
+
+If the SDK is unpacked into `.toolchains/ps5-payload-sdk/ps5-payload-sdk`, the
+helper script sets the required environment automatically:
+
+```sh
+scripts/build_ps5.sh clean all
+```
+
+For a system-wide SDK install, set `PS5_PAYLOAD_SDK` yourself:
+
+```sh
+export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+make clean all
+```
+
+Override paths and ports as needed:
+
+```sh
+make ETAHEN_SOURCE_DIR="/path/to/etaHEN/Source Code" PATCHDL_HTTP_PORT=12881
+```
+
+Deploy with an ELF loader listening on the PS5:
+
+```sh
+PS5_HOST=ps5 PS5_PORT=9021 scripts/build_ps5.sh test
+```

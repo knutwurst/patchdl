@@ -1,6 +1,7 @@
 PS5_HOST ?= ps5
 PS5_PORT ?= 9021
 PATCHDL_HTTP_PORT ?= 12880
+ETAHEN_SOURCE_DIR ?= ../Source Code
 
 ifdef PS5_PAYLOAD_SDK
     include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
@@ -16,9 +17,8 @@ SRCS := src/main.c src/patchdl_assets.c src/patchdl_websrv.c
 WEB_ASSETS := web/index.html web/styles.css web/app.js
 GEN_SRCS := $(patsubst web/%,gen/web/%.c,$(WEB_ASSETS))
 
-CFLAGS := -g -O2 -Wall -Werror -Isrc -DPATCHDL_HTTP_PORT=$(PATCHDL_HTTP_PORT)
-LDADD := -lkernel_sys
-LDADD += `$(PS5_PAYLOAD_SDK)/bin/prospero-pkg-config libmicrohttpd --libs`
+CFLAGS := -g -O2 -Wall -Werror -Isrc -I"$(ETAHEN_SOURCE_DIR)/include" -DPATCHDL_HTTP_PORT=$(PATCHDL_HTTP_PORT)
+LDADD := -L"$(ETAHEN_SOURCE_DIR)/lib" -lmicrohttpd -lkernel_sys
 
 all: $(BIN)
 
