@@ -92,7 +92,6 @@ typedef struct dl_job {
     int                pieces_done;
     int                pieces_failed;
     int                inflight;
-    int                unpersisted;    /* DONE pieces since last sidecar flush */
     int                fd;             /* O_RDWR dest fd, -1 until admit */
     int                rc;             /* 0 ok, -1 net/io, -2 verify */
     struct dl_job     *next;
@@ -1225,7 +1224,7 @@ admit_next(void) {
     patchdl_manifest_free(&q->mf);
     free(q->ps);     q->ps     = NULL;
     free(q->bitmap); q->bitmap = NULL;
-    q->done_bytes = 0; q->pieces_failed = 0; q->unpersisted = 0; q->rc = 0;
+    q->done_bytes = 0; q->pieces_failed = 0; q->rc = 0;
 
     q->mf = mf; q->ps = ps; q->bitmap = bitmap; q->fd = fd; q->total = total;
     for (int i = 0; i < mf.count; i++) q->ps[i].slot = -1;
@@ -1351,7 +1350,11 @@ dl_worker(void *arg) {
             job->pieces_done++;
             job->done_bytes += sz;
             job->bitmap[pidx / 8] |= (unsigned char)(1 << (pidx % 8));
-            if (++job->unpersisted >= 8) { write_job_state(job); job->unpersisted = 0; }
+            /* Persist after every completed piece: the bytes were already
+               fdatasync'd, and a tiny atomic sidecar write means an unclean
+               kill re-downloads only the pieces still in flight, not a batch
+               of up-to-8 already-finished ones. */
+            write_job_state(job);
         } else if (job->abort &&
                    (job->state == JOB_PAUSING || job->state == JOB_CANCELLING)) {
             job->ps[pidx].state = PC_PENDING;   /* aborted by pause -> redo on resume */

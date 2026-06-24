@@ -186,11 +186,17 @@
                   <span class="track"></span>
                 </span>
               </label>
-              <label class="field">
-                <span>Parallel download connections</span>
-                <input id="maxConnections" type="number" min="1" max="16" step="1"
-                       title="Connections used to download a patch in parallel — applies live on Save (raising is instant; lowering settles as in-flight pieces finish)" />
-              </label>
+              <div class="switch-row">
+                <span>
+                  <strong>Parallel download connections</strong>
+                  <em>1–16 · applies live, no payload restart</em>
+                </span>
+                <div class="stepper" role="group" aria-label="Parallel download connections">
+                  <button type="button" class="stepper-btn" id="connMinus" aria-label="Fewer connections">−</button>
+                  <output class="stepper-value" id="connValue" aria-live="polite">4</output>
+                  <button type="button" class="stepper-btn" id="connPlus" aria-label="More connections">+</button>
+                </div>
+              </div>
             </div>
 
             <div class="allowlist">

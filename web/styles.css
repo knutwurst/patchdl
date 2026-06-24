@@ -395,6 +395,34 @@ h2 { font-size: 18px; line-height: 1.2; }
   background: var(--surface-2);
   border-radius: 8px;
 }
+
+/* number stepper — big, controller-friendly targets with a clear focus ring
+   (the UI is operated by the PS5 controller via the home tile). */
+.stepper { display: inline-flex; align-items: center; gap: 12px; flex: none; }
+.stepper-btn {
+  width: 54px; height: 54px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 30px; line-height: 1; font-weight: 600;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: background .12s ease, border-color .12s ease, transform .07s ease;
+}
+.stepper-btn:hover { background: var(--surface); border-color: var(--muted); }
+.stepper-btn:active { transform: scale(0.93); background: var(--green-soft); border-color: var(--green); }
+/* :focus (not only :focus-visible) so the controller's focus is always obvious */
+.stepper-btn:focus { outline: none; border-color: var(--green); box-shadow: 0 0 0 3px var(--green-soft); }
+.stepper-btn:disabled { opacity: 0.32; cursor: default; transform: none; }
+.stepper-value {
+  min-width: 52px;
+  text-align: center;
+  font-size: 26px; font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
 .switch-row > span:first-child strong { display: block; font-size: 14px; }
 .switch-row > span:first-child em { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; font-style: normal; }
 

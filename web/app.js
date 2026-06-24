@@ -117,7 +117,9 @@ function bindElements() {
     deleteAfterInstall: document.getElementById("deleteAfterInstall"),
     verifyDownloads: document.getElementById("verifyDownloads"),
     homeShortcut: document.getElementById("homeShortcut"),
-    maxConnections: document.getElementById("maxConnections"),
+    connValue: document.getElementById("connValue"),
+    connMinus: document.getElementById("connMinus"),
+    connPlus: document.getElementById("connPlus"),
     refreshBtn: document.getElementById("refreshBtn"),
     saveBtn: document.getElementById("saveBtn"),
     clearLogBtn: document.getElementById("clearLogBtn"),
@@ -150,6 +152,10 @@ function bindEvents() {
   els.refreshBtn.addEventListener("click", loadInitialData);
   els.saveBtn.addEventListener("click", saveConfig);
   els.clearLogBtn.addEventListener("click", () => { state.logs = []; renderLogs(); });
+  if (els.connMinus)
+    els.connMinus.addEventListener("click", () => setConnections(clampConn(state.config.max_connections) - 1));
+  if (els.connPlus)
+    els.connPlus.addEventListener("click", () => setConnections(clampConn(state.config.max_connections) + 1));
 }
 
 function setView(view) {
@@ -228,6 +234,40 @@ function renderStatus() {
   if (els.railSpace) els.railSpace.textContent = `${space} free`;
 }
 
+const CONN_MIN = 1, CONN_MAX = 16;
+function clampConn(n) {
+  n = parseInt(n, 10);
+  if (!Number.isFinite(n)) n = 4;
+  return Math.max(CONN_MIN, Math.min(CONN_MAX, n));
+}
+
+function renderConnStepper() {
+  const n = clampConn(state.config.max_connections);
+  if (els.connValue) els.connValue.textContent = String(n);
+  if (els.connMinus) els.connMinus.disabled = n <= CONN_MIN;
+  if (els.connPlus) els.connPlus.disabled = n >= CONN_MAX;
+}
+
+let connSaveTimer = null;
+// Stepper +/-: update + re-render immediately, then persist just this field
+// (debounced) so rapid taps collapse into one POST and other unsaved form
+// fields stay untouched. The server applies the new count live (no restart).
+function setConnections(n) {
+  const v = clampConn(n);
+  if (v === clampConn(state.config.max_connections)) { renderConnStepper(); return; }
+  state.config.max_connections = v;
+  renderConnStepper();
+  clearTimeout(connSaveTimer);
+  connSaveTimer = setTimeout(async () => {
+    try {
+      await postJson(API.config, { max_connections: v });
+      showToast(`Parallel connections: ${v}`);
+    } catch (e) {
+      showToast("Could not save connections — API not reachable.");
+    }
+  }, 450);
+}
+
 function renderSettings() {
   els.defaultPolicy.value = state.config.default_policy || "deny";
   els.downloadDir.value = state.config.download_dir || "";
@@ -235,7 +275,7 @@ function renderSettings() {
   els.deleteAfterInstall.checked = Boolean(state.config.delete_pkg_after_install);
   if (els.verifyDownloads) els.verifyDownloads.checked = Boolean(state.config.verify_downloads);
   if (els.homeShortcut) els.homeShortcut.checked = state.config.home_shortcut !== false;
-  if (els.maxConnections) els.maxConnections.value = state.config.max_connections || 4;
+  renderConnStepper();
   els.allowlistHosts.replaceChildren(...(state.config.cdn_allowlist || []).map((host) => {
     const chip = document.createElement("span");
     chip.className = "host-chip";
@@ -615,9 +655,7 @@ async function saveConfig() {
     delete_pkg_after_install: els.deleteAfterInstall.checked,
     verify_downloads: els.verifyDownloads ? els.verifyDownloads.checked : Boolean(state.config.verify_downloads),
     home_shortcut: els.homeShortcut ? els.homeShortcut.checked : state.config.home_shortcut !== false,
-    max_connections: els.maxConnections
-      ? Math.max(1, Math.min(16, parseInt(els.maxConnections.value, 10) || 4))
-      : (state.config.max_connections || 4),
+    max_connections: clampConn(state.config.max_connections),
   };
   try {
     await postJson(API.config, config);
