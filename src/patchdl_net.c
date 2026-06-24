@@ -452,8 +452,12 @@ http_download_to_file_progress(const char *url, FILE *fp, long long *bytes_out,
     curl_easy_setopt(curl, CURLOPT_SSL_CIPHER_LIST, "DEFAULT@SECLEVEL=0");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,  1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS,       5L);
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR,       "https");
-    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    /* HTTPS pin removed on the streaming download path: the Sony CDN sometimes
+       302s a piece URL to a signed http:// edge inside its own infrastructure,
+       and refusing those redirects was breaking real-world downloads.
+       host_allowed + TLS-against-pinned-root on every leg already gate the
+       hosts we'll talk to. NOSIGNAL stays — it protects the worker from a
+       SIGPIPE on connection RST. */
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL,        1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,  20L);
     /* No total timeout (patches can be large); abort only on a long stall. */
@@ -822,7 +826,8 @@ int
 patchdl_http_download_piece(const char *url, int fd,
                             long long file_offset, long long file_size,
                             const char *expected_sha256_or_null,
-                            patchdl_piece_ctx_t *ctx) {
+                            patchdl_piece_ctx_t *ctx,
+                            int *curl_rc_out, long *http_code_out) {
     CURL             *curl;
     CURLcode          res;
     long              http_code = 0;
@@ -831,6 +836,9 @@ patchdl_http_download_piece(const char *url, int fd,
     struct curl_blob  ca_blob;
     piece_sink_t      sink;
     int               verify = (expected_sha256_or_null && expected_sha256_or_null[0]);
+
+    if (curl_rc_out)   *curl_rc_out   = 0;
+    if (http_code_out) *http_code_out = 0;
 
     if (url_host(url, host, sizeof(host))) return -1;
     if (!host_allowed(host)) return -1;
@@ -871,8 +879,8 @@ patchdl_http_download_piece(const char *url, int fd,
     curl_easy_setopt(curl, CURLOPT_SSL_CIPHER_LIST, "DEFAULT@SECLEVEL=0");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,  1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS,       5L);
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR,       "https");
-    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    /* HTTPS pin removed on the streaming piece path — see the same change in
+       http_download_to_file_progress for the why. */
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL,        1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR,     1L);   /* 4xx/5xx -> error, no body written */
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,  20L);
@@ -889,6 +897,9 @@ patchdl_http_download_piece(const char *url, int fd,
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     curl_easy_cleanup(curl);
     curl_slist_free_all(rl);
+
+    if (curl_rc_out)   *curl_rc_out   = (int)res;
+    if (http_code_out) *http_code_out = http_code;
 
     if (res != CURLE_OK) {
         if (sink.md) EVP_MD_CTX_free(sink.md);

@@ -52,11 +52,14 @@ typedef struct {
 
 /* Download one whole piece and pwrite it into `fd` at `file_offset`. Concurrent
    non-overlapping pieces of the same fd are safe. Returns 0 on success (and
-   fdatasyncs fd), -1 on network/IO/abort, -2 on a SHA-256 mismatch. */
+   fdatasyncs fd), -1 on network/IO/abort, -2 on a SHA-256 mismatch.
+   `curl_rc_out`/`http_code_out` (either may be NULL) receive the last libcurl
+   CURLcode + HTTP status for failure diagnosis. */
 int patchdl_http_download_piece(const char *url, int fd,
                                 long long file_offset, long long file_size,
                                 const char *expected_sha256_or_null,
-                                patchdl_piece_ctx_t *ctx);
+                                patchdl_piece_ctx_t *ctx,
+                                int *curl_rc_out, long *http_code_out);
 
 /* Read-only: SHA-256 a [offset, offset+size) region of fd into out_hex
    (caller provides >= 65 bytes). Returns 0 on success. */

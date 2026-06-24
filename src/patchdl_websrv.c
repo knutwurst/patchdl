@@ -96,6 +96,8 @@ typedef struct dl_job {
     int                inflight;
     int                fd;             /* O_RDWR dest fd, -1 until admit */
     int                rc;             /* 0 ok, -1 net/io, -2 verify */
+    int                last_curl_rc;   /* CURLcode from the most recent piece */
+    long               last_http_code; /* HTTP status from the most recent piece */
     struct dl_job     *next;
 } dl_job_t;
 
@@ -827,6 +829,8 @@ build_downloads_json(void) {
         jbuf_append(&j, ",\"state\":");     jbuf_append_str(&j, job_state_str(job->state));
         jbuf_appendf(&j, ",\"progress\":%d", progress);
         jbuf_appendf(&j, ",\"bytes\":%lld,\"total_bytes\":%lld", bytes, total);
+        jbuf_appendf(&j, ",\"rc\":%d,\"last_curl_rc\":%d,\"last_http_code\":%ld",
+                     job->rc, job->last_curl_rc, job->last_http_code);
         jbuf_append(&j, "}");
     }
     jbuf_append(&j, "]");
@@ -1340,6 +1344,7 @@ admit_next(void) {
     free(q->ps);     q->ps     = NULL;
     free(q->bitmap); q->bitmap = NULL;
     q->done_bytes = 0; q->pieces_failed = 0; q->rc = 0;
+    q->last_curl_rc = 0; q->last_http_code = 0;
 
     q->mf = mf; q->ps = ps; q->bitmap = bitmap; q->fd = fd; q->total = total;
     for (int i = 0; i < mf.count; i++) q->ps[i].slot = -1;
@@ -1447,15 +1452,22 @@ dl_worker(void *arg) {
         pthread_mutex_unlock(&g_pool.mtx);
 
         /* ---- download the piece, NO lock ---- */
+        int  last_curl_rc   = 0;
+        long last_http_code = 0;
         {
             patchdl_piece_ctx_t ctx = { &g_pool.inflight_bytes[slot], abort_ptr };
             rc = patchdl_http_download_piece(url, fd, off, sz,
-                                             verify && hash[0] ? hash : NULL, &ctx);
+                                             verify && hash[0] ? hash : NULL, &ctx,
+                                             &last_curl_rc, &last_http_code);
         }
 
         pthread_mutex_lock(&g_pool.mtx);
         g_pool.inflight_bytes[slot] = 0;
         job->inflight--;
+        if (rc != 0) {
+            job->last_curl_rc   = last_curl_rc;
+            job->last_http_code = last_http_code;
+        }
         job->ps[pidx].slot = -1;
         if (my_seq != job->seq) {
             /* job cancelled/torn down under us: discard result (do not touch
