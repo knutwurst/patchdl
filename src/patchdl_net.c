@@ -488,8 +488,11 @@ http_download_to_file_progress(const char *url, FILE *fp, long long *bytes_out,
         unsigned char dig[EVP_MAX_MD_SIZE];
         unsigned int  dlen = 0;
         char          hex[2 * EVP_MAX_MD_SIZE + 1];
-        EVP_DigestFinal_ex(sink.md, dig, &dlen);
+        int           ok = EVP_DigestFinal_ex(sink.md, dig, &dlen);
         EVP_MD_CTX_free(sink.md);
+        /* Fail-closed on a digest API failure — otherwise hex would be empty
+           and we'd silently report -2 with no diagnostic. */
+        if (ok != 1 || dlen == 0) return -2;
         hex_encode(dig, dlen, hex, sizeof(hex));
         if (strcasecmp(hex, expected_sha256_hex) != 0)
             return -2;          /* integrity mismatch */
@@ -893,8 +896,9 @@ patchdl_http_download_piece(const char *url, int fd,
         unsigned char dig[EVP_MAX_MD_SIZE];
         unsigned int  dl = 0;
         char          hex[2 * EVP_MAX_MD_SIZE + 1];
-        EVP_DigestFinal_ex(sink.md, dig, &dl);
+        int           ok = EVP_DigestFinal_ex(sink.md, dig, &dl);
         EVP_MD_CTX_free(sink.md);
+        if (ok != 1 || dl == 0) return -2;
         hex_encode(dig, dl, hex, sizeof(hex));
         if (strcasecmp(hex, expected_sha256_or_null) != 0)
             return -2;                      /* integrity mismatch */
@@ -929,8 +933,9 @@ patchdl_sha256_fd_region(int fd, long long offset, long long size, char *out_hex
     {
         unsigned char dig[EVP_MAX_MD_SIZE];
         unsigned int  dl = 0, i;
-        EVP_DigestFinal_ex(md, dig, &dl);
-        for (i = 0; i < dl; i++) sprintf(out_hex + 2 * i, "%02x", dig[i]);
+        int           ok = EVP_DigestFinal_ex(md, dig, &dl);
+        if (ok != 1 || dl == 0) { free(buf); EVP_MD_CTX_free(md); return -1; }
+        for (i = 0; i < dl; i++) snprintf(out_hex + 2 * i, 3, "%02x", dig[i]);
         out_hex[2 * dl] = '\0';
     }
     free(buf);

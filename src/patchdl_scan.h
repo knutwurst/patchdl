@@ -40,3 +40,9 @@ const char *patchdl_source_str(patchdl_source_t src);
 /* Diagnostic: malloc'd JSON dump of the mount table + scan-base directory
    listings. Caller frees. */
 char       *patchdl_scan_debug_json(void);
+
+/* Mark scan/debug as no longer safe to call (must be set after MHD worker
+   threads come up — patchdl_scan performs a process-wide vnode swap that
+   would race any concurrent thread). After this is set, both entry points
+   return immediately. Call once during startup, after MHD_start_daemon. */
+void        patchdl_scan_lock(void);

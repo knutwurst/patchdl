@@ -162,7 +162,10 @@ json_get_int(const char *s, const char *key, int dflt) {
     return (int)strtol(p, NULL, 10);
 }
 
-/* Find `"key":"value"` and copy value into out. */
+/* Find `"key":"value"` and copy value into out. Decodes the common JSON
+   string escapes (\" \\ \/ \n \r \t \b \f). \uXXXX is collapsed to '?' —
+   we don't accept multi-byte content in any field here. An unknown escape
+   keeps the payload byte. */
 static void
 json_get_str(const char *s, const char *key, char *out, size_t sz) {
     out[0] = '\0';
@@ -177,7 +180,31 @@ json_get_str(const char *s, const char *key, char *out, size_t sz) {
     if (*p != '"') return;
     p++;
     size_t i = 0;
-    while (*p && *p != '"' && i + 1 < sz) out[i++] = *p++;
+    while (*p && *p != '"' && i + 1 < sz) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            switch (*p) {
+            case '"':  out[i++] = '"';  break;
+            case '\\': out[i++] = '\\'; break;
+            case '/':  out[i++] = '/';  break;
+            case 'n':  out[i++] = '\n'; break;
+            case 'r':  out[i++] = '\r'; break;
+            case 't':  out[i++] = '\t'; break;
+            case 'b':  out[i++] = '\b'; break;
+            case 'f':  out[i++] = '\f'; break;
+            case 'u':
+                /* \uXXXX: not needed for any field we accept; drop to '?' so
+                   neither the surrogate pair nor the hex digits leak. */
+                if (p[1] && p[2] && p[3] && p[4]) p += 4;
+                out[i++] = '?';
+                break;
+            default:   out[i++] = *p;   break;
+            }
+            p++;
+        } else {
+            out[i++] = *p++;
+        }
+    }
     out[i] = '\0';
 }
 
@@ -1820,6 +1847,11 @@ handle_config_post(struct MHD_Connection *conn, const char *body) {
     int  mc;
 
     json_get_str(body, "default_policy", pol, sizeof(pol));
+    /* Only the two real values are accepted; anything else is silently
+       dropped so a malformed POST can't corrupt config.json or the JSON
+       we later round-trip out of /api/config. */
+    if (pol[0] && strcmp(pol, "allow") != 0 && strcmp(pol, "deny") != 0)
+        pol[0] = '\0';
 
     pthread_mutex_lock(&g_mutex);
     if (pol[0]) {
@@ -2037,6 +2069,8 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         patchdl_manifest_t mf;
         jbuf_t           j = {0};
 
+        if (!path_segment_safe(tid))
+            return queue_text(conn, MHD_HTTP_FORBIDDEN, "forbidden");
         if (!get_title_action_info(tid, &src, purl, sizeof purl,
                                    durl_, sizeof durl_,
                                    pti, sizeof pti,
@@ -2074,6 +2108,8 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         patchdl_manifest_t mf;
         jbuf_t             j = {0};
 
+        if (!path_segment_safe(tid))
+            return queue_text(conn, MHD_HTTP_FORBIDDEN, "forbidden");
         if (!get_title_action_info(tid, &src, purl, sizeof purl,
                                    durl_, sizeof durl_,
                                    pti, sizeof pti,
@@ -2123,6 +2159,8 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         patchdl_source_t src;
         int              en, is_app = 0, rc;
 
+        if (!path_segment_safe(tid))
+            return queue_text(conn, MHD_HTTP_FORBIDDEN, "forbidden");
         if (!get_title_action_info(tid, &src, purl, sizeof purl,
                                    durl_, sizeof durl_,
                                    pti, sizeof pti,
@@ -2275,6 +2313,11 @@ patchdl_websrv_start(unsigned short port) {
         g_title_count = 0;
         return -1;
     }
+
+    /* Lock further patchdl_scan / patchdl_scan_debug_json calls — both do a
+       process-wide vnode swap that is only safe before MHD worker threads
+       come up. After this point the only scan happens internally above. */
+    patchdl_scan_lock();
 
     /* Start background verxml fetch — joinable so patchdl_websrv_stop can wait
        for it before freeing g_titles (it reads g_titles across blocking queries). */

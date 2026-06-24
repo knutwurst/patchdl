@@ -5,6 +5,7 @@
 
 #include <dirent.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -389,6 +390,15 @@ merge_appdb(patchdl_title_t *arr, size_t cnt) {
     patchdl_appdb_free(info);
 }
 
+/* See patchdl_scan_lock — both vnode-swap entry points return -1 / NULL once
+   this is set so a late rescan call can't race the running MHD threads. */
+static _Atomic int g_scan_locked = 0;
+
+void
+patchdl_scan_lock(void) {
+    atomic_store(&g_scan_locked, 1);
+}
+
 int
 patchdl_scan(patchdl_title_t **titles_out, size_t *count_out) {
     patchdl_title_t *arr;
@@ -399,6 +409,8 @@ patchdl_scan(patchdl_title_t **titles_out, size_t *count_out) {
 
     struct statfs *mounts = NULL;
     int            nmounts;
+
+    if (atomic_load(&g_scan_locked)) return -1;
 
     arr = calloc(MAX_TITLES, sizeof(*arr));
     if (!arr) return -1;
@@ -467,6 +479,8 @@ patchdl_scan_debug_json(void) {
     char   tmp[2048];
     pid_t  pid = getpid();
     intptr_t saved_root = 0, root_vnode;
+
+    if (atomic_load(&g_scan_locked)) return NULL;
     int    using_vswap = 0;
     struct statfs *mounts = NULL;
     int    nmounts;
