@@ -127,6 +127,7 @@ function bindElements() {
     connPlus: document.getElementById("connPlus"),
     refreshBtn: document.getElementById("refreshBtn"),
     updateAllBtn: document.getElementById("updateAllBtn"),
+    brandVersion: document.getElementById("brandVersion"),
     saveBtn: document.getElementById("saveBtn"),
     clearLogBtn: document.getElementById("clearLogBtn"),
     toast: document.getElementById("toast"),
@@ -240,6 +241,8 @@ function renderStatus() {
   els.downloadDirValue.textContent = state.status.download_dir || state.config.download_dir || "Download target";
   if (els.railFw) els.railFw.textContent = `FW ${state.status.firmware || "--"}`;
   if (els.railSpace) els.railSpace.textContent = `${space} free`;
+  if (els.brandVersion)
+    els.brandVersion.textContent = state.status.version ? `v${state.status.version}` : "v--";
 }
 
 const CONN_MIN = 1, CONN_MAX = 16;

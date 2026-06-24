@@ -6,6 +6,7 @@
 #include "patchdl_net.h"
 #include "patchdl_resolve.h"
 #include "patchdl_verxml.h"
+#include "patchdl_version.h"
 
 #include <microhttpd.h>
 #include <pthread.h>
@@ -585,8 +586,9 @@ build_status_json(void) {
              "\"dns_guard\":\"Active\","
              "\"resolver\":\"Internal allowlist\","
              "\"free_space_mb\":%lld,"
-             "\"download_dir\":\"/data/patchdl (internal)\"}",
-             g_fw.str, g_fw.bin, data_free_mb());
+             "\"download_dir\":\"/data/patchdl (internal)\","
+             "\"version\":\"%s\"}",
+             g_fw.str, g_fw.bin, data_free_mb(), PATCHDL_VERSION);
     return out;
 }
 
