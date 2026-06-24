@@ -452,6 +452,9 @@ http_download_to_file_progress(const char *url, FILE *fp, long long *bytes_out,
     curl_easy_setopt(curl, CURLOPT_SSL_CIPHER_LIST, "DEFAULT@SECLEVEL=0");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,  1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS,       5L);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR,       "https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,        1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,  20L);
     /* No total timeout (patches can be large); abort only on a long stall. */
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
@@ -868,6 +871,9 @@ patchdl_http_download_piece(const char *url, int fd,
     curl_easy_setopt(curl, CURLOPT_SSL_CIPHER_LIST, "DEFAULT@SECLEVEL=0");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,  1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS,       5L);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR,       "https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,        1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR,     1L);   /* 4xx/5xx -> error, no body written */
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,  20L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
@@ -1060,6 +1066,9 @@ patchdl_net_diag(const char *url, char *out_json, size_t sz) {
             curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
             curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
             curl_easy_setopt(curl, CURLOPT_SSL_CIPHER_LIST, "DEFAULT@SECLEVEL=0");
+            curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR,       "https");
+            curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+            curl_easy_setopt(curl, CURLOPT_NOSIGNAL,        1L);
             curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
             res = curl_easy_perform(curl);
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);

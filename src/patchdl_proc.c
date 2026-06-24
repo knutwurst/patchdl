@@ -65,7 +65,10 @@ patchdl_proc_kill_others(const char *name) {
     int   killed = 0;
     pid_t pid;
 
-    while ((pid = find_pid(name)) > 0) {
+    /* Bound the loop: at startup we expect 0-1 stale instance. A pathological
+       proc table (or kill returning success but the process not exiting) would
+       otherwise stall startup for sleep(1) × N. */
+    while (killed < 8 && (pid = find_pid(name)) > 0) {
         if (kill(pid, SIGKILL))
             break;
         killed++;

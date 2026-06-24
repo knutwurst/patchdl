@@ -27,6 +27,14 @@ lookup_tsv(const char *title_id, char *url_out, size_t url_sz) {
             fclose(fp);
             return -1;
         }
+        /* Defense in depth: the TSV file lives under /data/patchdl, writable
+           by anyone with /data access. patchdl_http_get also enforces
+           host_allowed, but rejecting non-https / non-Sony schemes here means
+           a poisoned line can't even reach the network layer. */
+        if (strncmp(url, "https://", 8) != 0) {
+            fclose(fp);
+            return -1;
+        }
         memcpy(url_out, url, len + 1);
         fclose(fp);
         return 0;
