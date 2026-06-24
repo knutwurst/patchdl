@@ -504,15 +504,13 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
                                         const char *dest_path,
                                         long long *bytes_out,
                                         patchdl_download_progress_cb cb,
-                                        void *ctx, int verify) {
+                                        void *ctx, int verify, int resume) {
     patchdl_buf_t manifest;
-    const char *pieces;
-    const char *p;
-    FILE *fp;
-    long long total = 0;
+    const char *pieces, *pieces_end, *p;
+    FILE *fp = NULL;
+    long long total = 0, have = 0;
     unsigned long long manifest_total = 0;
-    int count = 0;
-    int rc = -1;
+    int count = 0, started, rc = -1;
 
     if (bytes_out) *bytes_out = 0;
     if (patchdl_http_get(manifest_url, &manifest))
@@ -529,14 +527,20 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
     }
     /* Bound the scan to the pieces array; otherwise a later "url" key in the
        manifest (e.g. playgoChunkCrcUrl) could be appended as a bogus piece. */
-    const char *pieces_end = strchr(pieces, ']');
+    pieces_end = strchr(pieces, ']');
     json_u64_after(manifest.data, "originalFileSize", &manifest_total);
 
-    fp = fopen(dest_path, "wb");
-    if (!fp) {
-        free(manifest.data);
-        return -1;
+    /* Resume: reopen the existing partial and keep its bytes; else start clean.
+       Pieces already fully on disk are skipped, and the one piece that was only
+       partially written is dropped and re-fetched whole (piece-granular resume,
+       no HTTP range needed). */
+    if (resume) {
+        fp = fopen(dest_path, "r+b");
+        if (fp) { fseek(fp, 0, SEEK_END); have = ftell(fp); if (have < 0) have = 0; }
     }
+    if (!fp) { fp = fopen(dest_path, "wb"); have = 0; }
+    if (!fp) { free(manifest.data); return -1; }
+    started = (have <= 0);
 
     p = pieces;
     while ((p = strstr(p, "\"url\"")) && (!pieces_end || p < pieces_end)) {
@@ -547,29 +551,51 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
         unsigned long long offset = 0;
         int have_offset, drc;
         const char *obj_end = strchr(p, '}');
-        progress_state_t progress = {
-            cb,
-            ctx,
-            total,
-            manifest_total ? (long long)manifest_total : 0
-        };
 
         if (json_string_after(p, "url", url, sizeof(url)))
             break;
         json_u64_after(p, "fileSize", &expected);
         have_offset = (json_u64_after(p, "fileOffset", &offset) == 0);
-        if (verify)
-            json_string_after(p, "hashValue", hash, sizeof(hash));
+
+        /* Piece already fully present from a previous run: skip the download. */
+        if (!started && have_offset && expected &&
+            have >= (long long)(offset + expected)) {
+            total = (long long)(offset + expected);
+            count++;
+            if (cb && cb(ctx, total, manifest_total ? (long long)manifest_total : total))
+                goto done;
+            p = obj_end ? obj_end + 1 : p + 5;
+            continue;
+        }
+
+        /* First piece we must (re)download: drop any partial bytes of it so the
+           appended data lines up exactly, then append from here on. */
+        if (!started) {
+            long long start_at = have_offset ? (long long)offset : 0;
+            fflush(fp);
+            if (ftruncate(fileno(fp), (off_t)start_at) != 0)
+                goto done;             /* can't resume cleanly; keep partial */
+            fseek(fp, 0, SEEK_END);
+            total = start_at;
+            started = 1;
+        }
 
         /* Pieces are concatenated in array order; each one's fileOffset must
-           equal the bytes written so far. A manifest that lists them out of
-           order would otherwise silently produce a corrupt package. */
+           equal the bytes written so far, or the package would be corrupt. */
         if (have_offset && offset != (unsigned long long)total)
             goto done;
 
-        /* drc: 0 ok, -1 network/cancel, -2 SHA-256 mismatch (propagated out). */
-        drc = http_download_to_file_progress(url, fp, &got, &progress,
-                                             hash[0] ? hash : NULL);
+        if (verify)
+            json_string_after(p, "hashValue", hash, sizeof(hash));
+
+        {
+            progress_state_t progress = {
+                cb, ctx, total, manifest_total ? (long long)manifest_total : 0
+            };
+            /* drc: 0 ok, -1 network/cancel, -2 SHA-256 mismatch. */
+            drc = http_download_to_file_progress(url, fp, &got, &progress,
+                                                 hash[0] ? hash : NULL);
+        }
         if (drc) {
             if (drc == -2) rc = -2;
             goto done;
@@ -593,7 +619,8 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
 done:
     fclose(fp);
     free(manifest.data);
-    if (rc) unlink(dest_path);
+    /* Keep the partial on failure so it can be resumed; the caller deletes it
+       on cancel or on a corrupt-verify (-2). */
     return rc;
 }
 
@@ -601,7 +628,7 @@ int
 patchdl_http_download_manifest(const char *manifest_url, const char *dest_path,
                                long long *bytes_out) {
     return patchdl_http_download_manifest_progress(manifest_url, dest_path,
-                                                  bytes_out, NULL, NULL, 0);
+                                                  bytes_out, NULL, NULL, 0, 0);
 }
 
 void
@@ -696,8 +723,8 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
                                         const char *dest_path,
                                         long long *bytes_out,
                                         patchdl_download_progress_cb cb,
-                                        void *ctx, int verify) {
-    (void)cb; (void)ctx; (void)verify;
+                                        void *ctx, int verify, int resume) {
+    (void)cb; (void)ctx; (void)verify; (void)resume;
     return patchdl_http_download_manifest(manifest_url, dest_path, bytes_out);
 }
 

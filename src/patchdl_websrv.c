@@ -589,6 +589,8 @@ build_titles_json(void) {
                      (!t->patch_title_id[0] ||
                       !strncmp(t->patch_title_id, t->title_id, 9)) ? "true" : "false");
         jbuf_appendf(&j, ",\"enabled\":%s", t->enabled ? "true" : "false");
+        jbuf_appendf(&j, ",\"resumable\":%s", t->resumable ? "true" : "false");
+        jbuf_appendf(&j, ",\"partial_bytes\":%lld", t->partial_bytes);
         jbuf_append(&j, ",\"mode\":");
             jbuf_append_str(&j, title_mode_str(t->source_type));
         jbuf_append(&j, ",\"queued\":false");
@@ -828,6 +830,8 @@ remove_title_dir(const char *title_id) {
     rmdir(dir);
 }
 
+static void set_title_resumable(const char *title_id, int resumable, long long bytes);
+
 /* Cancel an in-progress download for this title (the worker aborts and removes
    the partial), or delete an already-downloaded package if nothing is running. */
 static enum MHD_Result
@@ -842,13 +846,80 @@ do_cancel(struct MHD_Connection *conn, const char *title_id) {
     }
     pthread_mutex_unlock(&g_mutex);
 
-    if (!was_active)
+    if (!was_active) {
         remove_title_dir(title_id);
+        set_title_resumable(title_id, 0, 0);
+    }
 
     snprintf(resp, sizeof(resp),
              "{\"ok\":true,\"cancelled\":%s,\"deleted\":true}",
              was_active ? "true" : "false");
     return queue_json_owned(conn, MHD_HTTP_OK, strdup(resp));
+}
+
+/* ---------- resume sidecar (/data/patchdl/<title>/state.json) ----------- */
+
+static long long
+file_size(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) return (long long)st.st_size;
+    return -1;
+}
+
+static void
+title_state_path(const char *title_id, char *out, size_t sz) {
+    snprintf(out, sz, "%s/%s/state.json", PATCHDL_DL_DIR, title_id);
+}
+
+/* Record which manifest a partial download belongs to, so a resume only
+   continues a partial that matches the current patch. Sony CDN URLs contain no
+   characters that need JSON escaping, so the value is embedded verbatim. */
+static void
+write_dl_state(const char *title_id, const char *manifest_url) {
+    char  path[320];
+    FILE *f;
+    title_state_path(title_id, path, sizeof(path));
+    f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "{\"manifest_url\":\"%s\"}\n", manifest_url);
+    fclose(f);
+}
+
+static int
+read_dl_state_url(const char *title_id, char *out, size_t sz) {
+    char   path[320], buf[1280];
+    FILE  *f;
+    size_t n;
+    out[0] = '\0';
+    title_state_path(title_id, path, sizeof(path));
+    f = fopen(path, "r");
+    if (!f) return -1;
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    json_get_str(buf, "manifest_url", out, sz);
+    return out[0] ? 0 : -1;
+}
+
+static void
+remove_dl_state(const char *title_id) {
+    char path[320];
+    title_state_path(title_id, path, sizeof(path));
+    unlink(path);
+}
+
+/* Keep the resumable flag (set at startup) in sync after a download finishes or
+   its partial is deleted, so /api/titles stops reporting a stale partial. */
+static void
+set_title_resumable(const char *title_id, int resumable, long long bytes) {
+    pthread_mutex_lock(&g_mutex);
+    for (size_t i = 0; i < g_title_count; i++)
+        if (!strcmp(g_titles[i].title_id, title_id)) {
+            g_titles[i].resumable = resumable;
+            g_titles[i].partial_bytes = bytes;
+            break;
+        }
+    pthread_mutex_unlock(&g_mutex);
 }
 
 static enum MHD_Result
@@ -857,7 +928,7 @@ do_download(struct MHD_Connection *conn, const char *title_id,
             const char *name, const char *version, int enabled) {
     char        dir[256], dest[320], resp[640];
     long long   bytes = 0;
-    int         verify = 0, dlrc;
+    int         verify = 0, dlrc, is_manifest, resume = 0;
 
     if (!enabled)
         return queue_json(conn, MHD_HTTP_FORBIDDEN,
@@ -877,6 +948,22 @@ do_download(struct MHD_Connection *conn, const char *title_id,
     mkdir(dir, 0777);
     title_pkg_path(title_id, patch_url, dest, sizeof(dest));
 
+    /* Resume: keep an existing partial only if it belongs to THIS manifest
+       (recorded in the sidecar); a partial from a different/older patch is
+       dropped. The partial survives a reboot because a killed process runs no
+       cleanup. Only manifest downloads resume. */
+    is_manifest = url_is_manifest(patch_url);
+    if (is_manifest && file_size(dest) > 0) {
+        char prev_url[1024] = {0};
+        if (read_dl_state_url(title_id, prev_url, sizeof(prev_url)) == 0 &&
+            !strcmp(prev_url, patch_url))
+            resume = 1;
+        else
+            unlink(dest);  /* stale partial from a different patch */
+    }
+    if (is_manifest)
+        write_dl_state(title_id, patch_url);
+
     pthread_mutex_lock(&g_mutex);
     if (g_dl.active) {
         pthread_mutex_unlock(&g_mutex);
@@ -892,9 +979,9 @@ do_download(struct MHD_Connection *conn, const char *title_id,
     verify = g_cfg.verify_downloads;
     pthread_mutex_unlock(&g_mutex);
 
-    dlrc = url_is_manifest(patch_url)
+    dlrc = is_manifest
         ? patchdl_http_download_manifest_progress(patch_url, dest, &bytes,
-                                                  download_progress_cb, NULL, verify)
+                                                  download_progress_cb, NULL, verify, resume)
         : patchdl_http_download_progress(patch_url, dest, &bytes,
                                          download_progress_cb, NULL);
     if (dlrc) {
@@ -905,16 +992,27 @@ do_download(struct MHD_Connection *conn, const char *title_id,
         g_dl.cancel = 0;
         pthread_mutex_unlock(&g_mutex);
 
-        /* The download function already unlinked the partial file on failure;
-           drop the now-empty title dir too. */
-        unlink(dest);
-        rmdir(dir);
-
-        if (was_cancel)
+        if (was_cancel) {
+            /* user cancelled: drop the partial + its resume sidecar */
+            unlink(dest);
+            remove_dl_state(title_id);
+            rmdir(dir);
+            set_title_resumable(title_id, 0, 0);
             return queue_json(conn, MHD_HTTP_OK,
                               "{\"ok\":false,\"cancelled\":true,"
                               "\"reason\":\"download_cancelled\"}");
-        /* -2 = a piece failed its SHA-256 (only possible when verify is on). */
+        }
+        if (dlrc == -2) {
+            /* corrupt data (failed SHA-256): don't keep it for resume */
+            unlink(dest);
+            remove_dl_state(title_id);
+            rmdir(dir);
+            set_title_resumable(title_id, 0, 0);
+        } else {
+            /* network failure: the partial + sidecar are kept, and the title is
+               now resumable (also survives a reboot). */
+            set_title_resumable(title_id, 1, file_size(dest));
+        }
         snprintf(resp, sizeof(resp), "{\"ok\":false,\"reason\":\"%s\"}",
                  dlrc == -2 ? "piece_verify_failed" : "download_failed");
         return queue_json_owned(conn, MHD_HTTP_BAD_GATEWAY, strdup(resp));
@@ -925,6 +1023,9 @@ do_download(struct MHD_Connection *conn, const char *title_id,
     g_dl.total = bytes;
     g_dl.active = 0;
     pthread_mutex_unlock(&g_mutex);
+
+    remove_dl_state(title_id);            /* complete: drop sidecar, keep the pkg */
+    set_title_resumable(title_id, 0, 0);  /* no longer a partial */
 
     /* shadowmount: download allowed, install is not (per source policy). */
     snprintf(resp, sizeof(resp),
@@ -1204,6 +1305,35 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
     return queue_asset(conn, url);
 }
 
+/* A title is resumable when its download dir holds both a resume sidecar and a
+   partial .pkg. Records the partial size for the UI. Single-threaded startup. */
+static void
+detect_resumable_partials(void) {
+    char           dir[288], state[320], pkg[576];
+    DIR           *d;
+    struct dirent *e;
+
+    for (size_t i = 0; i < g_title_count; i++) {
+        patchdl_title_t *t = &g_titles[i];
+        title_state_path(t->title_id, state, sizeof(state));
+        if (file_size(state) < 0) continue;          /* no sidecar -> not resumable */
+        snprintf(dir, sizeof(dir), "%s/%s", PATCHDL_DL_DIR, t->title_id);
+        d = opendir(dir);
+        if (!d) continue;
+        while ((e = readdir(d))) {
+            size_t nl = strlen(e->d_name);
+            if (nl > 4 && !strcmp(e->d_name + nl - 4, ".pkg")) {
+                long long sz;
+                snprintf(pkg, sizeof(pkg), "%s/%s", dir, e->d_name);
+                sz = file_size(pkg);
+                if (sz > 0) { t->resumable = 1; t->partial_bytes = sz; }
+                break;
+            }
+        }
+        closedir(d);
+    }
+}
+
 /* ---------- lifecycle -------------------------------------------------- */
 
 int
@@ -1225,6 +1355,10 @@ patchdl_websrv_start(unsigned short port) {
     for (size_t i = 0; i < g_title_count; i++)
         g_titles[i].enabled = (g_titles[i].source_type != PATCHDL_SOURCE_UNKNOWN);
     load_config();
+
+    /* Flag titles that have a partial download on disk so the UI can offer
+       Resume after a reboot. */
+    detect_resumable_partials();
 
     /* Build the diagnostic dump now, while single-threaded — the root-vnode
        swap it performs is unsafe once MHD worker threads are running. */

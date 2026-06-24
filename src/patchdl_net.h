@@ -29,14 +29,17 @@ int patchdl_http_download_progress(const char *url, const char *dest_path,
 
 /* Download a Sony JSON package manifest by concatenating every entry in
    "pieces" into one installable PKG. When `verify` is non-zero each piece is
-   checked against its manifest SHA-256 (a mismatch returns -2). */
+   checked against its manifest SHA-256 (a mismatch returns -2). When `resume`
+   is non-zero an existing partial at dest_path is kept: fully-downloaded pieces
+   are skipped and only the remainder is fetched (survives a reboot). On any
+   failure the partial is left in place for a later resume. */
 int patchdl_http_download_manifest(const char *manifest_url, const char *dest_path,
                                    long long *bytes_out);
 int patchdl_http_download_manifest_progress(const char *manifest_url,
                                             const char *dest_path,
                                             long long *bytes_out,
                                             patchdl_download_progress_cb cb,
-                                            void *ctx, int verify);
+                                            void *ctx, int verify, int resume);
 
 /* Diagnostic: run the GET pipeline for `url` and write a JSON report
    (dns result/ip, curl code, http status, bytes) into `out_json`. */

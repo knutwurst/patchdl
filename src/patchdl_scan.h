@@ -28,6 +28,8 @@ typedef struct {
     char             patch_storage_title_id[16]; /* title id embedded in delta_url */
     int              verxml_done;
     int              enabled;          /* user policy, persisted in config.json */
+    int              resumable;        /* a partial download is on disk */
+    long long        partial_bytes;    /* size of that partial, for the UI */
 } patchdl_title_t;
 
 int         patchdl_scan(patchdl_title_t **titles_out, size_t *count_out);

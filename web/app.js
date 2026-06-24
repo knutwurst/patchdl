@@ -312,6 +312,7 @@ function createGameCard(game) {
     </div>
     <div class="pills">
       ${game.downloading ? `<span class="pill live">Downloading</span>` : ""}
+      ${game.resumable && !game.downloading ? `<span class="pill warn">Paused</span>` : ""}
       ${statusPill(game)}
       ${sourcePill(game)}
     </div>
@@ -334,12 +335,12 @@ function createGameCard(game) {
     else btn.addEventListener("click", () => runTitleAction(game.title_id, act.action));
     actions.appendChild(btn);
   }
-  // Delete a finished (not-yet-installed) download.
-  if (game.downloaded && !game.installing && !game.downloading) {
+  // Delete a finished or paused (partial) download.
+  if ((game.downloaded || game.resumable) && !game.installing && !game.downloading) {
     const del = document.createElement("button");
     del.className = "row-button is-ghost";
     del.textContent = "Delete";
-    del.title = "Delete the downloaded package";
+    del.title = game.resumable ? "Delete the partial download" : "Delete the downloaded package";
     del.addEventListener("click", () => cancelDownload(game.title_id));
     actions.appendChild(del);
   }
@@ -357,6 +358,17 @@ function createGameCard(game) {
       <div class="progress-meta">${progressMetaHtml(d)}</div>
     `;
     card.appendChild(prog);
+  } else if (game.resumable && game.partial_bytes > 0) {
+    // ---- paused partial (survived a reboot) ----
+    const note = document.createElement("div");
+    note.className = "card-progress";
+    note.innerHTML = `
+      <div class="progress-meta">
+        <span>Paused — <b>${formatBytes(game.partial_bytes)}</b> downloaded</span>
+        <span>Resume to continue</span>
+      </div>
+    `;
+    card.appendChild(note);
   }
 
   return card;
@@ -391,6 +403,8 @@ function tileButton(game) {
   if (!isInstallAllowed(game)) return null;
   if (game.downloaded && game.status === "available")
     return { label: "Install", action: "install", variant: "update", hint: "Install the downloaded patch (modifies the game)." };
+  if (game.resumable)
+    return { label: "Resume", action: "download", variant: "update", hint: "Resume the interrupted download where it stopped." };
   if (game.status !== "available") return null;
   return state.config.install_after_download
     ? { label: "Update", action: "update", variant: "update", hint: "Download and install the update." }
@@ -603,6 +617,8 @@ async function doDownload(game) {
   }
 
   game.downloaded = true;
+  game.resumable = false;
+  game.partial_bytes = 0;
   const sz = r && r.bytes ? formatBytes(r.bytes) : "?";
   state.logs.push(`[${timeNow()}] Downloaded ${game.title_id} ${game.compatible_version} (${sz}, internal)`);
   showToast(`${game.name}: downloaded ${sz}.`);
@@ -640,7 +656,13 @@ async function cancelDownload(titleId) {
   } catch (error) {
     showToast(`${game ? game.name : titleId}: ${reasonText(error)}`);
   }
-  if (game) { game.downloading = false; game._localDownloading = false; game.downloaded = false; }
+  if (game) {
+    game.downloading = false;
+    game._localDownloading = false;
+    game.downloaded = false;
+    game.resumable = false;
+    game.partial_bytes = 0;
+  }
   state.downloads = state.downloads.filter((i) => i.title_id !== titleId);
   state.logs.push(`[${timeNow()}] Download cancelled / deleted: ${titleId}`);
   renderGames(); renderLogs();
