@@ -305,6 +305,69 @@ path_segment_safe(const char *s) {
     return 1;
 }
 
+/* Validate a local PKG path for /api/install_aip: must be exactly
+   <PATCHDL_DL_DIR>/<safe-title-id>/<safe-filename>. Rejects anything
+   outside /data/patchdl/, anything with .. or unsafe chars. */
+static int
+local_install_path_safe(const char *path) {
+    const char *prefix = PATCHDL_DL_DIR "/";
+    size_t      plen   = strlen(prefix);
+    const char *tail, *slash;
+    char        seg[64];
+    size_t      len;
+
+    if (!path || strncmp(path, prefix, plen) != 0) return 0;
+    tail  = path + plen;
+    slash = strchr(tail, '/');
+    if (!slash || slash == tail) return 0;
+    len = (size_t)(slash - tail);
+    if (len >= sizeof(seg)) return 0;
+    memcpy(seg, tail, len);
+    seg[len] = '\0';
+    if (!path_segment_safe(seg)) return 0;
+
+    tail = slash + 1;
+    if (!tail[0] || strchr(tail, '/')) return 0;
+    if (strlen(tail) >= sizeof(seg)) return 0;
+    return path_segment_safe(tail);
+}
+
+/* Whitelist of CDN hosts /api/install_uri may target. Mirrors
+   ALLOWED_HOSTS in patchdl_net.c — kept in sync by hand. */
+static const char *INSTALL_URI_HOSTS[] = {
+    "sgst.prod.dl.playstation.net",
+    "gst.prod.dl.playstation.net",
+    "gs2.ww.prod.dl.playstation.net",
+    NULL,
+};
+
+/* Validate an install URI for /api/install_uri: must be https:// to one of
+   INSTALL_URI_HOSTS (or a subdomain). Rejects file://, http://, redirects
+   to other hosts (libcurl enforces via host_allowed at fetch time). */
+static int
+install_uri_safe(const char *uri) {
+    const char *host_start, *end;
+    size_t      hlen;
+    char        host[128];
+
+    if (!uri || strncmp(uri, "https://", 8) != 0) return 0;
+    host_start = uri + 8;
+    end        = strpbrk(host_start, "/:?");
+    hlen       = end ? (size_t)(end - host_start) : strlen(host_start);
+    if (hlen == 0 || hlen >= sizeof(host)) return 0;
+    memcpy(host, host_start, hlen);
+    host[hlen] = '\0';
+
+    for (int i = 0; INSTALL_URI_HOSTS[i]; i++) {
+        size_t alen = strlen(INSTALL_URI_HOSTS[i]);
+        if (hlen == alen && !strcasecmp(host, INSTALL_URI_HOSTS[i])) return 1;
+        if (hlen > alen + 1 &&
+            host[hlen - alen - 1] == '.' &&
+            !strcasecmp(host + hlen - alen, INSTALL_URI_HOSTS[i])) return 1;
+    }
+    return 0;
+}
+
 typedef struct {
     int      fd;
     uint64_t start;
@@ -1821,6 +1884,16 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
             if (!uri[0])
                 return queue_json(conn, MHD_HTTP_BAD_REQUEST,
                                   "{\"ok\":false,\"reason\":\"uri required\"}");
+            if (!install_uri_safe(uri))
+                return queue_json(conn, MHD_HTTP_FORBIDDEN,
+                                  "{\"ok\":false,\"reason\":\"uri_not_allowed\","
+                                  "\"hint\":\"https:// only, host must be Sony CDN\"}");
+            if (tid[0] && !path_segment_safe(tid))
+                return queue_json(conn, MHD_HTTP_BAD_REQUEST,
+                                  "{\"ok\":false,\"reason\":\"title_id_unsafe\"}");
+            if (cid[0] && !path_segment_safe(cid))
+                return queue_json(conn, MHD_HTTP_BAD_REQUEST,
+                                  "{\"ok\":false,\"reason\":\"content_id_unsafe\"}");
             rc = patchdl_install_by_uri(uri, tid[0] ? tid : NULL,
                                         cid[0] ? cid : NULL, msg, sizeof(msg));
             snprintf(resp, sizeof(resp),
@@ -1841,6 +1914,17 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
             if (!path[0])
                 return queue_json(conn, MHD_HTTP_BAD_REQUEST,
                                   "{\"ok\":false,\"reason\":\"path required\"}");
+            if (!local_install_path_safe(path))
+                return queue_json(conn, MHD_HTTP_FORBIDDEN,
+                                  "{\"ok\":false,\"reason\":\"path_not_allowed\","
+                                  "\"hint\":\"must be " PATCHDL_DL_DIR
+                                  "/<title_id>/<filename>\"}");
+            if (tid[0] && !path_segment_safe(tid))
+                return queue_json(conn, MHD_HTTP_BAD_REQUEST,
+                                  "{\"ok\":false,\"reason\":\"title_id_unsafe\"}");
+            if (cid[0] && !path_segment_safe(cid))
+                return queue_json(conn, MHD_HTTP_BAD_REQUEST,
+                                  "{\"ok\":false,\"reason\":\"content_id_unsafe\"}");
             rc = patchdl_install_app_pkg(path, tid[0] ? tid : NULL,
                                          cid[0] ? cid : NULL, msg, sizeof(msg));
             snprintf(resp, sizeof(resp),
@@ -2133,6 +2217,11 @@ patchdl_websrv_start(unsigned short port) {
         MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_THREAD_PER_CONNECTION,
         port, NULL, NULL, &on_request, NULL,
         MHD_OPTION_NOTIFY_COMPLETED, request_completed, NULL,
+        /* DoS guards: bound concurrent sockets + per-IP to keep a misbehaving
+           LAN client from exhausting pthreads on the PS5. */
+        MHD_OPTION_CONNECTION_LIMIT,        (unsigned int)64,
+        MHD_OPTION_PER_IP_CONNECTION_LIMIT, (unsigned int)8,
+        MHD_OPTION_CONNECTION_TIMEOUT,      (unsigned int)30,
         MHD_OPTION_END);
 
     if (!web_daemon) {
