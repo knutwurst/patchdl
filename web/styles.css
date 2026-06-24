@@ -173,6 +173,105 @@ h2 { font-size: 18px; line-height: 1.2; }
   margin-bottom: 18px;
 }
 
+/* ---------------- global download banner ---------------- */
+/* Sticky banner above the status strip, visible only while at least one
+   download is queued/active. The pulse dot and gradient bar at the bottom
+   echo the per-game card progress styling so the two read as one system. */
+.global-dl {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 18px;
+  padding: 16px 18px 0;
+  border: 1px solid var(--border);
+  background:
+    radial-gradient(120% 80% at 0% 0%, var(--green-soft), transparent 60%),
+    linear-gradient(180deg, rgba(56, 193, 114, 0.06), transparent 60%),
+    var(--surface);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.global-dl[hidden] { display: none; }
+
+.global-dl-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+.global-dl-pulse {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 0 var(--green);
+  animation: globalDlPulse 1.6s ease-out infinite;
+}
+
+@keyframes globalDlPulse {
+  0%   { box-shadow: 0 0 0 0 rgba(56, 193, 114, 0.55); }
+  70%  { box-shadow: 0 0 0 14px rgba(56, 193, 114, 0);   }
+  100% { box-shadow: 0 0 0 0 rgba(56, 193, 114, 0);      }
+}
+
+.global-dl-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+
+.global-dl-line1 {
+  display: flex; align-items: baseline; gap: 10px;
+  min-width: 0; flex-wrap: wrap;
+}
+.global-dl-eyebrow {
+  text-transform: uppercase; letter-spacing: 0.08em;
+  font-size: 11px; font-weight: 600; color: var(--green-dark);
+}
+.global-dl-name {
+  font-size: 16px; font-weight: 600; color: #fff;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  min-width: 0; flex: 1;
+}
+.global-dl-position {
+  font-size: 12px; color: var(--muted);
+  padding: 2px 8px; border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04); border: 1px solid var(--border);
+}
+.global-dl-position[hidden] { display: none; }
+
+.global-dl-line2 {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.global-dl-line2 b { color: #d6dde4; font-weight: 600; }
+.global-dl-sep { opacity: 0.5; }
+
+.global-dl-track {
+  position: relative;
+  height: 3px;
+  margin: 0 -18px;     /* extend bar edge-to-edge */
+  background: rgba(56, 193, 114, 0.08);
+  overflow: hidden;
+}
+.global-dl-bar {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--green) 0%, var(--green-dark) 100%);
+  box-shadow: 0 0 12px rgba(56, 193, 114, 0.4);
+  transition: width 400ms ease-out;
+}
+.global-dl-bar.is-indeterminate {
+  width: 32% !important;
+  animation: globalDlIndet 1.6s ease-in-out infinite;
+}
+@keyframes globalDlIndet {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(320%);  }
+}
+
 .metric {
   min-width: 0;
   padding: 14px 16px;

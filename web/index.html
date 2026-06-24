@@ -80,6 +80,29 @@
             </div>
           </header>
 
+          <aside id="globalDl" class="global-dl" hidden aria-live="polite">
+            <div class="global-dl-row">
+              <span class="global-dl-pulse" aria-hidden="true"></span>
+              <div class="global-dl-text">
+                <div class="global-dl-line1">
+                  <span class="global-dl-eyebrow" id="globalDlState">Downloading</span>
+                  <strong class="global-dl-name" id="globalDlName">—</strong>
+                  <span class="global-dl-position" id="globalDlPosition" hidden></span>
+                </div>
+                <div class="global-dl-line2">
+                  <span id="globalDlPct">0%</span>
+                  <span class="global-dl-sep" aria-hidden="true">·</span>
+                  <span id="globalDlSpeed">—</span>
+                  <span class="global-dl-sep" aria-hidden="true">·</span>
+                  <span id="globalDlEta">—</span>
+                </div>
+              </div>
+            </div>
+            <div class="global-dl-track">
+              <i class="global-dl-bar" id="globalDlBar" style="width:0%"></i>
+            </div>
+          </aside>
+
           <section class="status-strip" aria-label="System status">
             <article class="metric">
               <span>Firmware</span>

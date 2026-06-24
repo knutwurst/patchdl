@@ -128,6 +128,14 @@ function bindElements() {
     refreshBtn: document.getElementById("refreshBtn"),
     updateAllBtn: document.getElementById("updateAllBtn"),
     brandVersion: document.getElementById("brandVersion"),
+    globalDl:         document.getElementById("globalDl"),
+    globalDlState:    document.getElementById("globalDlState"),
+    globalDlName:     document.getElementById("globalDlName"),
+    globalDlPosition: document.getElementById("globalDlPosition"),
+    globalDlPct:      document.getElementById("globalDlPct"),
+    globalDlSpeed:    document.getElementById("globalDlSpeed"),
+    globalDlEta:      document.getElementById("globalDlEta"),
+    globalDlBar:      document.getElementById("globalDlBar"),
     saveBtn: document.getElementById("saveBtn"),
     clearLogBtn: document.getElementById("clearLogBtn"),
     toast: document.getElementById("toast"),
@@ -299,6 +307,7 @@ function renderSettings() {
 /* ---------------- games ---------------- */
 
 function renderGames() {
+  renderGlobalStatus();
   const visible = state.titles.filter(matchesFilter).filter(matchesQuery);
   els.gameGrid.replaceChildren();
 
@@ -692,8 +701,62 @@ function downloadingIds() {
   return state.titles.filter((g) => g.downloading).map((g) => g.title_id).join(",");
 }
 
+// Top-of-page status banner. Visible while any job in this batch is queued,
+// active, or has just finished (done jobs linger one or two polls before the
+// pool reaps them, which is what gives us the "5 of 9" position).
+function renderGlobalStatus() {
+  const el = els.globalDl;
+  if (!el) return;
+  const jobs   = state.downloads || [];
+  const batch  = jobs.filter((j) => ["queued", "active", "done"].includes(j.state));
+  const flying = batch.filter((j) => j.state === "queued" || j.state === "active");
+
+  if (flying.length === 0) { el.hidden = true; return; }
+  el.hidden = false;
+
+  const active = batch.find((j) => j.state === "active") || flying[0];
+  const total  = batch.length;
+  const done   = batch.filter((j) => j.state === "done").length;
+  const pos    = Math.min(total, done + 1);
+  const isActive = active && active.state === "active";
+
+  // Eyebrow + name
+  els.globalDlState.textContent = isActive ? "Downloading" : "Queued";
+  els.globalDlName.textContent  = active.name || active.title_id || "—";
+
+  // Position chip ("3 of 9") only when there's more than one game in this run
+  if (total > 1) {
+    els.globalDlPosition.hidden = false;
+    els.globalDlPosition.textContent = `${pos} of ${total}`;
+  } else {
+    els.globalDlPosition.hidden = true;
+  }
+
+  // Progress line
+  const pct   = pctOf(active);
+  const speed = Number(active._speed) || 0;
+  const done_ = Number(active.bytes) || 0;
+  const total_ = Number(active.total_bytes) || 0;
+  els.globalDlPct.innerHTML   = isActive ? `<b>${pct}%</b>` : `<b>—</b> waiting`;
+  els.globalDlSpeed.innerHTML = isActive && speed > 0
+    ? `<b>${formatBytes(speed)}/s</b>`
+    : (isActive && !total_ ? "fetching manifest…" : "—");
+  els.globalDlEta.innerHTML = isActive && speed > 0 && total_ > done_
+    ? `ETA <b>${formatEta((total_ - done_) / speed)}</b>`
+    : "";
+
+  // Bar: animated indeterminate while fetching manifest, otherwise width=pct
+  if (isActive && total_ > 0) {
+    els.globalDlBar.classList.remove("is-indeterminate");
+    els.globalDlBar.style.width = pct + "%";
+  } else {
+    els.globalDlBar.classList.add("is-indeterminate");
+  }
+}
+
 // Update the progress bar/meta in place to avoid rebuilding every card each tick.
 function applyDownloadProgress() {
+  renderGlobalStatus();
   let needRender = false;
   state.downloads.forEach((d) => {
     // Only titles currently downloading render a progress tile; paused/done/error
