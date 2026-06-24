@@ -323,9 +323,11 @@ function renderGames() {
 
 // Mutually-exclusive bucket per game for the filter chips.
 function gameCategory(game) {
-  // In-flight work (queued, active, paused, installing) lives in its own
-  // bucket so Updatable shows only what the user could still trigger.
-  if (game.installing || game.downloading || game.resumable) return "updating";
+  // Updating is the queue — jobs waiting for a pool slot. An actively
+  // downloading game stays under Updatable so you don't lose sight of it
+  // while drilling into the queue; same for paused (the user knows where
+  // it is and can resume from the card) and installing.
+  if (game._jobState === "queued") return "updating";
   // checking is transient (version lookup still running); keep it visible under
   // Updatable rather than letting it fall out of every specific filter.
   if (game.status === "checking") return "updatable";
@@ -569,9 +571,11 @@ function reconcileFromJobs(jobs) {
         g._localDownloading = false;
       }
       if (g.downloading && !g._localDownloading) g.downloading = false;
+      g._jobState = null;
       return;
     }
     g._localDownloading = false; // the pool now tracks it
+    g._jobState = j.state;
     if (j.state === "active" || j.state === "queued") {
       g.downloading = true;
       g.resumable = false;
