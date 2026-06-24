@@ -325,8 +325,8 @@ function createGameCard(game) {
 
   const actions = document.createElement("div");
   actions.className = "card-actions";
-  const act = tileButton(game);
-  if (act) {
+  [primaryButton(game), stopButton(game)].forEach((act) => {
+    if (!act) return;
     const btn = document.createElement("button");
     btn.className = `row-button is-${act.variant}`;
     btn.textContent = act.label;
@@ -334,16 +334,7 @@ function createGameCard(game) {
     if (act.disabled) btn.disabled = true;
     else btn.addEventListener("click", () => runTitleAction(game.title_id, act.action));
     actions.appendChild(btn);
-  }
-  // Delete a finished or paused (partial) download.
-  if ((game.downloaded || game.resumable) && !game.installing && !game.downloading) {
-    const del = document.createElement("button");
-    del.className = "row-button is-ghost";
-    del.textContent = "Delete";
-    del.title = game.resumable ? "Delete the partial download" : "Delete the downloaded package";
-    del.addEventListener("click", () => cancelDownload(game.title_id));
-    actions.appendChild(del);
-  }
+  });
 
   row.append(lead, body, actions);
   card.appendChild(row);
@@ -394,21 +385,30 @@ function buildToggle(game) {
   return toggle;
 }
 
-// The single morphing action button: blue Update/Download/Install, or amber
-// Cancel while a download runs. Fixed width (CSS) so the label never reflows.
-function tileButton(game) {
+// Primary play/pause button (green to go, amber while downloading). Fixed width
+// (CSS) so the label never reflows. Returns null when there is nothing to do.
+function primaryButton(game) {
   if (game.installing) return { label: "Installing…", variant: "ghost", disabled: true };
-  if (game.downloading) return { label: "Cancel", action: "cancel", variant: "cancel", hint: "Stop the download and delete the partial file" };
+  if (game.downloading) return { label: "Pause", action: "pause", variant: "pause", hint: "Pause the download (keeps what was downloaded)." };
   if (game.patch_title_match === false) return null;
   if (!isInstallAllowed(game)) return null;
+  if (game.resumable)
+    return { label: "Resume", action: "download", variant: "update", hint: "Continue the paused download where it stopped." };
   if (game.downloaded && game.status === "available")
     return { label: "Install", action: "install", variant: "update", hint: "Install the downloaded patch (modifies the game)." };
-  if (game.resumable)
-    return { label: "Resume", action: "download", variant: "update", hint: "Resume the interrupted download where it stopped." };
   if (game.status !== "available") return null;
   return state.config.install_after_download
     ? { label: "Update", action: "update", variant: "update", hint: "Download and install the update." }
     : { label: "Download", action: "download", variant: "update", hint: "Download the patch internally." };
+}
+
+// Red stop button: present whenever there is a download to stop or discard.
+// Cancel stops AND deletes (unlike Pause, which keeps the partial).
+function stopButton(game) {
+  if (game.installing) return null;
+  if (game.downloading || game.resumable || game.downloaded)
+    return { label: "Cancel", action: "cancel", variant: "cancel", hint: "Stop and delete the download." };
+  return null;
 }
 
 function statusPill(game) {
@@ -606,12 +606,20 @@ async function doDownload(game) {
   game._localDownloading = false;
   state.downloads = state.downloads.filter((i) => i.title_id !== game.title_id);
 
-  // Cancel / soft failure returns HTTP 200 with ok:false (not thrown).
+  // Cancel / pause / soft failure returns HTTP 200 with ok:false (not thrown).
   if (!r || r.ok === false) {
     game.downloaded = false;
-    const what = r && r.cancelled ? "cancelled" : "failed";
-    state.logs.push(`[${timeNow()}] Download ${what}: ${game.title_id}`);
-    showToast(`${game.name}: download ${what}.`);
+    if (r && r.paused) {
+      // Paused: keep the partial, mark resumable so the tile shows Resume.
+      game.resumable = true;
+      game.partial_bytes = r.bytes || game.partial_bytes || 0;
+      state.logs.push(`[${timeNow()}] Download paused: ${game.title_id} (${formatBytes(game.partial_bytes)})`);
+      showToast(`${game.name}: paused at ${formatBytes(game.partial_bytes)}.`);
+    } else {
+      const what = r && r.cancelled ? "cancelled" : "failed";
+      state.logs.push(`[${timeNow()}] Download ${what}: ${game.title_id}`);
+      showToast(`${game.name}: download ${what}.`);
+    }
     renderGames(); renderLogs(); stopDownloadPolling();
     return false;
   }
@@ -674,8 +682,20 @@ async function runTitleAction(titleId, action) {
   if (!game) return;
   if (action === "download") await doDownload(game);
   else if (action === "install") await doInstall(game);
+  else if (action === "pause") await doPause(game);
   else if (action === "cancel") await cancelDownload(titleId);
   else if (action === "update") { if (await doDownload(game)) await doInstall(game); }
+}
+
+// Pause only sends the signal; the in-flight doDownload() request returns its
+// "paused" result and updates the card (resumable + partial bytes).
+async function doPause(game) {
+  try {
+    await postJson(API.action(game.title_id, "pause"), {});
+    showToast(`${game.name}: pausing…`);
+  } catch (error) {
+    showToast(`${game.name}: ${reasonText(error)}`);
+  }
 }
 
 function updateGame(titleId, patch) {
@@ -733,6 +753,8 @@ const REASON_TEXT = {
   download_in_progress: "Another download is already running.",
   piece_verify_failed: "A downloaded piece failed its SHA-256 check.",
   title_disabled: "This title is disabled.",
+  download_paused: "Download paused.",
+  not_downloading: "Nothing is downloading for this title.",
 };
 function reasonText(error) {
   const r = error && error.body && error.body.reason;

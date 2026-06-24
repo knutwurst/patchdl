@@ -79,7 +79,7 @@ http://<console-ip>:12880/
 
 ## Status
 
-0.0.2, early. Title scan, source classification, version resolution,
+0.0.3, early. Title scan, source classification, version resolution,
 firmware-compatibility filtering, target/storage-id handling, and the local
 AppInstUtil HTTP stream have been verified on firmware 11.60. PatchDL now
 downloads PS5 update manifests as merged piece packages under `/data/patchdl`;

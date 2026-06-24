@@ -331,10 +331,13 @@ h2 { font-size: 18px; line-height: 1.2; }
   width: 100%;            /* fills the fixed-width actions column -> never reflows */
   padding: 0 12px;
 }
-.row-button.is-update  { border-color: var(--blue);  color: #04111f; background: var(--blue); }
-.row-button.is-update:hover  { background: var(--blue-dark); }
-.row-button.is-cancel  { border-color: var(--amber); color: #1c1402; background: var(--amber); }
-.row-button.is-cancel:hover  { background: var(--amber-dark); }
+/* go = green (Update / Resume / Install), pause = amber, cancel/stop = red */
+.row-button.is-update  { border-color: var(--green); color: #04150c; background: var(--green); }
+.row-button.is-update:hover  { background: var(--green-dark); }
+.row-button.is-pause   { border-color: var(--amber); color: #1c1402; background: var(--amber); }
+.row-button.is-pause:hover   { background: var(--amber-dark); }
+.row-button.is-cancel  { border-color: var(--red);   color: #1a0606; background: var(--red); }
+.row-button.is-cancel:hover  { background: #ff8a8a; }
 .row-button.is-ghost   { background: transparent; color: var(--muted); }
 .row-button.is-ghost:hover { color: var(--ink); border-color: var(--muted); }
 .row-button:disabled { opacity: 0.6; cursor: default; }

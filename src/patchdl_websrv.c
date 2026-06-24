@@ -43,7 +43,8 @@ static struct {
 
 static struct {
     int       active;
-    int       cancel;      /* set by a cancel request; the worker aborts */
+    int       cancel;      /* set by a cancel request; worker aborts + deletes */
+    int       pause;       /* set by a pause request; worker aborts, keeps partial */
     char      title_id[32];
     char      name[128];
     char      version[16];
@@ -788,19 +789,19 @@ url_is_manifest(const char *url) {
     return n > 5 && !strcmp(url + n - 5, ".json");
 }
 
-/* Returns non-zero to abort the download when a cancel has been requested. */
+/* Returns non-zero to abort the download when a cancel OR pause is requested. */
 static int
 download_progress_cb(void *ctx, long long downloaded, long long total) {
-    int cancel;
+    int abort_now;
     (void)ctx;
     pthread_mutex_lock(&g_mutex);
     if (g_dl.active) {
         g_dl.downloaded = downloaded;
         g_dl.total = total;
     }
-    cancel = g_dl.cancel;
+    abort_now = g_dl.cancel || g_dl.pause;
     pthread_mutex_unlock(&g_mutex);
-    return cancel;
+    return abort_now;
 }
 
 /* Delete a title's internal download directory and its contents (a partial or
@@ -855,6 +856,23 @@ do_cancel(struct MHD_Connection *conn, const char *title_id) {
              "{\"ok\":true,\"cancelled\":%s,\"deleted\":true}",
              was_active ? "true" : "false");
     return queue_json_owned(conn, MHD_HTTP_OK, strdup(resp));
+}
+
+/* Pause an in-progress download: the worker aborts but the partial is kept on
+   disk (and marked resumable), so it can be continued later. */
+static enum MHD_Result
+do_pause(struct MHD_Connection *conn, const char *title_id) {
+    int active = 0;
+    pthread_mutex_lock(&g_mutex);
+    if (g_dl.active && !strcmp(g_dl.title_id, title_id)) {
+        g_dl.pause = 1;
+        active = 1;
+    }
+    pthread_mutex_unlock(&g_mutex);
+    if (!active)
+        return queue_json(conn, MHD_HTTP_CONFLICT,
+                          "{\"ok\":false,\"reason\":\"not_downloading\"}");
+    return queue_json(conn, MHD_HTTP_OK, "{\"ok\":true,\"paused\":true}");
 }
 
 /* ---------- resume sidecar (/data/patchdl/<title>/state.json) ----------- */
@@ -985,15 +1003,18 @@ do_download(struct MHD_Connection *conn, const char *title_id,
         : patchdl_http_download_progress(patch_url, dest, &bytes,
                                          download_progress_cb, NULL);
     if (dlrc) {
-        int was_cancel;
+        int       was_cancel, was_pause;
+        long long have;
         pthread_mutex_lock(&g_mutex);
         was_cancel = g_dl.cancel;
+        was_pause  = g_dl.pause;
         g_dl.active = 0;
         g_dl.cancel = 0;
+        g_dl.pause  = 0;
         pthread_mutex_unlock(&g_mutex);
 
         if (was_cancel) {
-            /* user cancelled: drop the partial + its resume sidecar */
+            /* user cancelled (stop): drop the partial + its resume sidecar */
             unlink(dest);
             remove_dl_state(title_id);
             rmdir(dir);
@@ -1001,6 +1022,16 @@ do_download(struct MHD_Connection *conn, const char *title_id,
             return queue_json(conn, MHD_HTTP_OK,
                               "{\"ok\":false,\"cancelled\":true,"
                               "\"reason\":\"download_cancelled\"}");
+        }
+        if (was_pause) {
+            /* user paused: keep the partial + sidecar; it is now resumable. */
+            have = file_size(dest);
+            if (have < 0) have = 0;
+            set_title_resumable(title_id, have > 0, have);
+            snprintf(resp, sizeof(resp),
+                     "{\"ok\":false,\"paused\":true,\"reason\":\"download_paused\","
+                     "\"bytes\":%lld}", have);
+            return queue_json_owned(conn, MHD_HTTP_OK, strdup(resp));
         }
         if (dlrc == -2) {
             /* corrupt data (failed SHA-256): don't keep it for resume */
@@ -1151,6 +1182,9 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
 
     if (!strcmp(action, "cancel"))
         return do_cancel(conn, title_id);
+
+    if (!strcmp(action, "pause"))
+        return do_pause(conn, title_id);
 
     if (!strcmp(action, "check"))
         return queue_json(conn, MHD_HTTP_ACCEPTED,

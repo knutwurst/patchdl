@@ -344,14 +344,20 @@ curl_progress_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
 }
 
 /* Returns 0 on success, -1 on download/network failure, -2 when an expected
-   SHA-256 was given and the downloaded bytes did not match it. */
+   SHA-256 was given and the downloaded bytes did not match it, -3 when a byte
+   range was requested (range_start>0) but the server ignored it (no HTTP 206).
+   When range_start>0 the body is appended at the file's current position, so
+   the caller must have it positioned at range_start and must not verify. */
 static int
 http_download_to_file_progress(const char *url, FILE *fp, long long *bytes_out,
                                progress_state_t *progress,
-                               const char *expected_sha256_hex) {
+                               const char *expected_sha256_hex,
+                               long long range_start) {
     CURL             *curl;
     CURLcode          res;
     char              host[256], ip[INET_ADDRSTRLEN], rs443[512], rs80[512];
+    char              range_hdr[48];
+    long              http_code = 0;
     struct curl_slist *rl = NULL;
     struct curl_blob  ca_blob;
     curl_off_t        dl = 0;
@@ -400,6 +406,10 @@ http_download_to_file_progress(const char *url, FILE *fp, long long *bytes_out,
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,  30L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT,       "patchdl/1.0");
+    if (range_start > 0) {
+        snprintf(range_hdr, sizeof(range_hdr), "%lld-", range_start);
+        curl_easy_setopt(curl, CURLOPT_RANGE, range_hdr);
+    }
     if (progress && progress->cb) {
         curl_easy_setopt(curl, CURLOPT_NOPROGRESS,       0L);
         curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_progress_cb);
@@ -407,6 +417,7 @@ http_download_to_file_progress(const char *url, FILE *fp, long long *bytes_out,
     }
 
     res = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     curl_easy_getinfo(curl, CURLINFO_SIZE_DOWNLOAD_T, &dl);
     curl_easy_cleanup(curl);
     curl_slist_free_all(rl);
@@ -414,6 +425,12 @@ http_download_to_file_progress(const char *url, FILE *fp, long long *bytes_out,
     if (res != CURLE_OK) {
         if (sink.md) EVP_MD_CTX_free(sink.md);
         return -1;
+    }
+    /* Asked for a byte range but the server sent the whole file (no 206): the
+       caller must drop the piece and re-fetch it whole. */
+    if (range_start > 0 && http_code != 206) {
+        if (sink.md) EVP_MD_CTX_free(sink.md);
+        return -3;
     }
 
     if (sink.md) {
@@ -440,7 +457,7 @@ patchdl_http_download_progress(const char *url, const char *dest_path,
     int rc;
 
     if (!fp) return -1;
-    rc = http_download_to_file_progress(url, fp, bytes_out, &progress, NULL);
+    rc = http_download_to_file_progress(url, fp, bytes_out, &progress, NULL, 0);
     fclose(fp);
 
     if (rc) {
@@ -531,9 +548,9 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
     json_u64_after(manifest.data, "originalFileSize", &manifest_total);
 
     /* Resume: reopen the existing partial and keep its bytes; else start clean.
-       Pieces already fully on disk are skipped, and the one piece that was only
-       partially written is dropped and re-fetched whole (piece-granular resume,
-       no HTTP range needed). */
+       Fully-downloaded pieces are skipped; the one piece that was only partially
+       written continues mid-piece via an HTTP byte range (with a fall back to
+       re-fetching it whole if the CDN ignores the range). */
     if (resume) {
         fp = fopen(dest_path, "r+b");
         if (fp) { fseek(fp, 0, SEEK_END); have = ftell(fp); if (have < 0) have = 0; }
@@ -546,10 +563,11 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
     while ((p = strstr(p, "\"url\"")) && (!pieces_end || p < pieces_end)) {
         char url[768];
         char hash[80] = {0};
-        long long got = 0;
+        long long got = 0, range_start = 0;
         unsigned long long expected = 0;
         unsigned long long offset = 0;
         int have_offset, drc;
+        const char *want_hash;
         const char *obj_end = strchr(p, '}');
 
         if (json_string_after(p, "url", url, sizeof(url)))
@@ -568,39 +586,68 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
             continue;
         }
 
-        /* First piece we must (re)download: drop any partial bytes of it so the
-           appended data lines up exactly, then append from here on. */
+        /* First piece to (re)download while resuming. If part of it is already
+           on disk, resume WITHIN it with a byte range; otherwise drop any stray
+           bytes and fetch it whole. After this, every piece is fetched whole. */
         if (!started) {
-            long long start_at = have_offset ? (long long)offset : 0;
-            fflush(fp);
-            if (ftruncate(fileno(fp), (off_t)start_at) != 0)
-                goto done;             /* can't resume cleanly; keep partial */
-            fseek(fp, 0, SEEK_END);
-            total = start_at;
+            if (have_offset && expected && have > (long long)offset &&
+                have < (long long)(offset + expected)) {
+                range_start = have - (long long)offset;  /* this piece's bytes on disk */
+                fseek(fp, 0, SEEK_END);                   /* append at `have` */
+                total = have;
+            } else {
+                long long start_at = have_offset ? (long long)offset : 0;
+                fflush(fp);
+                if (ftruncate(fileno(fp), (off_t)start_at) != 0)
+                    goto done;             /* can't resume cleanly; keep partial */
+                fseek(fp, 0, SEEK_END);
+                total = start_at;
+            }
             started = 1;
         }
 
-        /* Pieces are concatenated in array order; each one's fileOffset must
-           equal the bytes written so far, or the package would be corrupt. */
-        if (have_offset && offset != (unsigned long long)total)
+        /* Whole pieces are concatenated in array order; a ranged (partial) piece
+           starts mid-piece, so the contiguity guard applies only to whole ones. */
+        if (have_offset && range_start == 0 && offset != (unsigned long long)total)
             goto done;
 
-        if (verify)
+        /* A ranged piece can't be hashed (only its tail is fetched). */
+        want_hash = NULL;
+        if (range_start == 0 && verify) {
             json_string_after(p, "hashValue", hash, sizeof(hash));
+            want_hash = hash[0] ? hash : NULL;
+        }
 
         {
             progress_state_t progress = {
                 cb, ctx, total, manifest_total ? (long long)manifest_total : 0
             };
-            /* drc: 0 ok, -1 network/cancel, -2 SHA-256 mismatch. */
+            /* drc: 0 ok, -1 network/cancel, -2 SHA-256, -3 range ignored. */
             drc = http_download_to_file_progress(url, fp, &got, &progress,
-                                                 hash[0] ? hash : NULL);
+                                                 want_hash, range_start);
+            if (drc == -3) {
+                /* Server ignored the range: drop the piece and fetch it whole. */
+                fflush(fp);
+                if (ftruncate(fileno(fp), (off_t)offset) != 0)
+                    goto done;
+                fseek(fp, 0, SEEK_END);
+                total = (long long)offset;
+                range_start = 0;
+                if (verify) {
+                    json_string_after(p, "hashValue", hash, sizeof(hash));
+                    want_hash = hash[0] ? hash : NULL;
+                }
+                progress.base = total;
+                drc = http_download_to_file_progress(url, fp, &got, &progress,
+                                                     want_hash, 0);
+            }
         }
         if (drc) {
             if (drc == -2) rc = -2;
             goto done;
         }
-        if (expected && (unsigned long long)got != expected)
+        /* range_start + got = this piece's bytes now on disk. */
+        if (expected && (unsigned long long)(range_start + got) != expected)
             goto done;
 
         total += got;
