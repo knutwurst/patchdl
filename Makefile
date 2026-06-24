@@ -23,7 +23,12 @@ SRCS := src/main.c \
         src/patchdl_resolve.c \
         src/patchdl_verxml.c \
         src/patchdl_install.c \
-        src/patchdl_notify.c
+        src/patchdl_notify.c \
+        src/patchdl_tile.c
+
+# patchdl_tile.c uses .incbin to embed param.json + icon0.png; touching the
+# assets must trigger a rebuild.
+TILE_ASSETS := assets/param.json assets/icon0.png
 
 WEB_ASSETS := web/index.html web/styles.css web/app.js
 GEN_SRCS := $(patsubst web/%,gen/web/%.c,$(WEB_ASSETS))
@@ -56,8 +61,8 @@ gen/web/%.c: web/% scripts/gen_asset_module.py | gen/web
 $(SQLITE_OBJ): $(SQLITE_DIR)/sqlite3.c
 	$(CC) $(SQLITE_CFLAGS) -c -o $@ $<
 
-$(BIN): $(SRCS) $(GEN_SRCS) $(SQLITE_OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDADD)
+$(BIN): $(SRCS) $(GEN_SRCS) $(SQLITE_OBJ) $(TILE_ASSETS)
+	$(CC) $(CFLAGS) -o $@ $(SRCS) $(GEN_SRCS) $(SQLITE_OBJ) $(LDADD)
 
 test: $(BIN)
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^

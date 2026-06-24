@@ -5,6 +5,7 @@
 #include "patchdl_install.h"
 #include "patchdl_net.h"
 #include "patchdl_resolve.h"
+#include "patchdl_tile.h"
 #include "patchdl_verxml.h"
 #include "patchdl_version.h"
 
@@ -1847,6 +1848,7 @@ static enum MHD_Result
 handle_config_post(struct MHD_Connection *conn, const char *body) {
     char pol[8];
     int  mc;
+    int  tile_just_enabled = 0;
 
     json_get_str(body, "default_policy", pol, sizeof(pol));
     /* Only the two real values are accepted; anything else is silently
@@ -1866,8 +1868,12 @@ handle_config_post(struct MHD_Connection *conn, const char *body) {
         json_get_bool(body, "delete_pkg_after_install", g_cfg.delete_pkg_after_install);
     g_cfg.verify_downloads =
         json_get_bool(body, "verify_downloads", g_cfg.verify_downloads);
-    g_cfg.home_shortcut =
-        json_get_bool(body, "home_shortcut", g_cfg.home_shortcut);
+    {
+        int prev_tile = g_cfg.home_shortcut;
+        g_cfg.home_shortcut =
+            json_get_bool(body, "home_shortcut", g_cfg.home_shortcut);
+        tile_just_enabled = (!prev_tile && g_cfg.home_shortcut);
+    }
     g_cfg.max_connections =
         json_get_int(body, "max_connections", g_cfg.max_connections);
     if (g_cfg.max_connections < 1) g_cfg.max_connections = 1;
@@ -1887,6 +1893,16 @@ handle_config_post(struct MHD_Connection *conn, const char *body) {
     pthread_mutex_unlock(&g_pool.mtx);
 
     save_config();
+
+    /* Trigger the tile install when the toggle just flipped on. Best-effort —
+       the config save is already committed; we don't want a tile error to
+       roll that back. Stat-guard inside the helper makes repeated calls a
+       no-op, so a save without flipping the toggle still costs nothing. */
+    if (tile_just_enabled) {
+        char tile_msg[256];
+        (void)patchdl_tile_install_if_needed(tile_msg, sizeof(tile_msg));
+    }
+
     return queue_json_owned(conn, MHD_HTTP_OK, build_config_json());
 }
 
@@ -1995,6 +2011,15 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
                      "\"path\":\"%.511s\",\"content_id\":\"%.63s\",\"title_id\":\"%.31s\"}",
                      rc == 0 ? "true" : "false", rc, (unsigned)rc, msg,
                      path, cid, tid);
+            return queue_json_owned(conn, rc == 0 ? MHD_HTTP_OK : MHD_HTTP_BAD_GATEWAY,
+                                    strdup(resp));
+        }
+        if (!strcmp(url, "/api/install_tile")) {
+            char msg[256], resp[320];
+            int  rc = patchdl_tile_install_if_needed(msg, sizeof(msg));
+            snprintf(resp, sizeof(resp),
+                     "{\"ok\":%s,\"rc\":%d,\"message\":\"%s\"}",
+                     rc == 0 ? "true" : "false", rc, msg);
             return queue_json_owned(conn, rc == 0 ? MHD_HTTP_OK : MHD_HTTP_BAD_GATEWAY,
                                     strdup(resp));
         }
@@ -2250,6 +2275,15 @@ patchdl_websrv_start(unsigned short port) {
     for (size_t i = 0; i < g_title_count; i++)
         g_titles[i].enabled = (g_titles[i].source_type != PATCHDL_SOURCE_UNKNOWN);
     load_config();
+
+    /* If the user opted into a home-screen tile, refresh it now. The helper
+       is stat-guarded — when nothing changed on disk it's a no-op, so the
+       cost on subsequent startups is two file reads. Best-effort: never
+       block startup on a tile install failure. */
+    if (g_cfg.home_shortcut) {
+        char tile_msg[256];
+        (void)patchdl_tile_install_if_needed(tile_msg, sizeof(tile_msg));
+    }
 
     /* Flag titles that have a partial download on disk so the UI can offer
        Resume after a reboot. */
