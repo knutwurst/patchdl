@@ -2013,8 +2013,17 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         return queue_json_owned(conn, MHD_HTTP_OK, strdup(p));
     }
 
-    if (!strcmp(url, "/api/pkgdiag"))
-        return queue_json(conn, MHD_HTTP_OK, g_pkg_diag_json);
+    if (!strcmp(url, "/api/pkgdiag")) {
+        /* Snapshot under the lock — otherwise MHD would read g_pkg_diag_json
+           in-place (RESPMEM_PERSISTENT) while record_pkg_diag is mid-snprintf,
+           producing a torn read or a missing NUL terminator. */
+        char snap[sizeof(g_pkg_diag_json)];
+        pthread_mutex_lock(&g_mutex);
+        memcpy(snap, g_pkg_diag_json, sizeof(snap));
+        pthread_mutex_unlock(&g_mutex);
+        snap[sizeof(snap) - 1] = '\0';
+        return queue_json_owned(conn, MHD_HTTP_OK, strdup(snap));
+    }
 
     /* Read-only diagnostic: re-fetch the patch manifest for a title (PatchDL can
        bypass the DNS block) and dump each piece's offset/size/SHA-256 so the

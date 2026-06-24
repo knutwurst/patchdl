@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -9,6 +10,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -32,6 +34,21 @@
    manifest JSON is a few MB at most — fail-closed beyond that. */
 #define PATCHDL_BUF_MAX_VERXML     (16  * 1024 * 1024)
 #define PATCHDL_BUF_MAX_MANIFEST   (64  * 1024 * 1024)
+
+#ifdef PATCHDL_HAVE_CURL
+/* Replacement for fopen("wb"/"r+b") that refuses to follow a symlink at the
+   destination (would let a malicious symlink redirect the download) and pins
+   the new file's mode to 0600. Returns NULL on any open error. */
+static FILE *
+fopen_safe(const char *path, int rw_existing) {
+    int flags = O_CLOEXEC | O_NOFOLLOW;
+    int fd;
+    flags |= rw_existing ? O_RDWR : (O_WRONLY | O_CREAT | O_TRUNC);
+    fd = open(path, flags, 0600);
+    if (fd < 0) return NULL;
+    return fdopen(fd, rw_existing ? "r+b" : "wb");
+}
+#endif
 
 #ifdef PATCHDL_HAVE_CURL
 
@@ -486,7 +503,7 @@ int
 patchdl_http_download_progress(const char *url, const char *dest_path,
                                long long *bytes_out,
                                patchdl_download_progress_cb cb, void *ctx) {
-    FILE *fp = fopen(dest_path, "wb");
+    FILE *fp = fopen_safe(dest_path, 0);
     progress_state_t progress = { cb, ctx, 0, 0 };
     int rc;
 
@@ -628,10 +645,10 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
        written continues mid-piece via an HTTP byte range (with a fall back to
        re-fetching it whole if the CDN ignores the range). */
     if (resume) {
-        fp = fopen(dest_path, "r+b");
+        fp = fopen_safe(dest_path, 1);
         if (fp) { fseek(fp, 0, SEEK_END); have = ftell(fp); if (have < 0) have = 0; }
     }
-    if (!fp) { fp = fopen(dest_path, "wb"); have = 0; }
+    if (!fp) { fp = fopen_safe(dest_path, 0); have = 0; }
     if (!fp) { free(manifest.data); return -1; }
     started = (have <= 0);
 

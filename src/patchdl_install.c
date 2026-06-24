@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,9 +113,12 @@ static ai_get_status_fn       ai_get_status;
    symbols via the kernel dynlib helpers. Runs in a detached thread; the HTTP
    handler reports the stage and never blocks.
    stage: 0 idle, 1 resolve loader, 2 load modules, 3 resolve symbols,
-   4 initialize, 5 ready, negative = failure at that step. */
-static volatile int    g_stage;
-static int             g_err;
+   4 initialize, 5 ready, negative = failure at that step.
+   Stored as _Atomic so the worker's release-store and the request handlers'
+   acquire-loads pair properly — the function pointers they read after
+   stage==5 must not be reordered ahead of the stage check. */
+static _Atomic int     g_stage;
+static _Atomic int     g_err;
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
 static char            g_probe_json[2048]; /* filled by the backend thread */
 static char            g_last_content_id[AI_CONTENTID_SIZE];

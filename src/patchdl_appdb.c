@@ -61,8 +61,12 @@ patchdl_appdb_load(patchdl_appinfo_t **out, size_t *count) {
     *out = NULL;
     *count = 0;
 
+    /* FULLMUTEX: today only the startup thread calls this, but future code
+       paths (a manual rescan triggered from the HTTP thread) would otherwise
+       race the SQLite handle. Cost is one mutex per call. */
     if (sqlite3_open_v2(APP_DB_URI, &db,
-                        SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL) != SQLITE_OK) {
+                        SQLITE_OPEN_READONLY | SQLITE_OPEN_URI |
+                        SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
         if (db) sqlite3_close(db);
         return -1;
     }
