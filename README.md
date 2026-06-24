@@ -1,31 +1,54 @@
 # PatchDL
 
 A standalone PlayStation 5 ELF payload that downloads and installs official game
-patches on your terms. It serves its own web UI and runs without etaHEN.
+patches on your terms. It serves its own dark-mode web UI and runs without
+etaHEN.
 
 PatchDL is built for setups where nanoDNS blocks Sony's servers for the whole
-console. It resolves the Sony patch CDN on its own path, so the rest of the
+console. It resolves the Sony patch CDN on its own DNS path, so the rest of the
 system stays offline and only the patches you pick get fetched.
 
 by Knutwurst
 
 ## What it does
 
-- Scans installed titles and classifies each one: genuine install,
-  ShadowMountPlus mount, preinstall, or unknown.
-- Reads the title name, installed version, and the Sony `version.xml` URL from
-  the PS5 app database.
-- Fetches each title's `version.xml` from Sony's CDN past nanoDNS (a raw DNS
-  query to 1.1.1.1) and verifies TLS against the pinned SCEI DNAS root.
+- Scans installed titles and classifies each: genuine install, ShadowMountPlus
+  mount, preinstall, or unknown.
+- Reads the title name, installed version, and Sony `version.xml` URL from the
+  PS5 app database.
+- Fetches each title's `version.xml` past nanoDNS (a raw DNS query to 1.1.1.1)
+  and verifies TLS against the pinned SCEI DNAS root.
 - Picks the newest patch compatible with the current firmware
   (`system_ver <= firmware`), so an update never forces a firmware upgrade.
-- Downloads the installable package from Sony's manifest pieces and installs it
-  through Sony's AppInstUtil service.
+- Downloads the patch from Sony's manifest pieces into one local `.pkg`, then
+  installs it through Sony's AppInstUtil service.
+
+## Downloading
+
+PatchDL pulls each patch over a pool of connections instead of one stream, which
+lifts the ~7 MB/s per-connection ceiling on the Sony CDN. Set the connection
+count (1 to 16) in Settings with the stepper; the change applies live, with no
+payload restart. One patch downloads at a time and further requests queue.
+
+Downloads survive interruptions:
+
+- **Resume across a reboot.** PatchDL records progress per manifest piece in a
+  sidecar beside the `.pkg`, written after every completed piece, so a reboot or
+  relaunch continues where it stopped.
+- **Pause, Resume, Cancel.** Pause keeps the partial file, Resume continues it,
+  Cancel deletes it. All three work at any point in a download.
+- **Verification.** Turn on "Verify downloaded pieces (SHA-256)" to check each
+  piece against its manifest hash while downloading. After a download you can
+  also verify the assembled package on-device against Sony's per-piece hashes
+  (`GET /api/pkgverify/<title_id>`).
+
+Patches download to `/data/patchdl` on the internal SSD. Large retail updates
+run tens of GB.
 
 ## Safety model
 
-Deny-by-default. A patch is installed only for a genuine install, and only when
-the patch metadata targets the installed game:
+Deny-by-default. A patch installs only for a genuine install, and only when the
+patch metadata targets the installed game:
 
 | Source                | Check | Download | Install |
 |-----------------------|-------|----------|---------|
@@ -33,29 +56,30 @@ the patch metadata targets the installed game:
 | shadowmount           | yes   | yes      | no      |
 | preinstall / unknown  | yes   | no       | no      |
 
-Two independent guards stop the wrong target being installed: the patch target
-id (read from `version.xml` / `manifest_url`) must match the installed game, and
-the install call receives the installed game's content id from app.db. Sony may
-store the actual patch bytes under a regional/master title id that differs from
-the target; that storage id is accepted only when `version.xml` targets the
-installed title. A true target-title mismatch is refused instead of installed as
-a phantom title.
+Two guards stop the wrong target being installed: the patch target id (from
+`version.xml` / `manifest_url`) must match the installed game, and the install
+call receives the installed game's content id from app.db. PatchDL refuses a
+true target-title mismatch rather than installing a phantom title.
 
-For PS5 titles, `delta_url` often points to a small `*-DP.pkg` helper package.
-That bootstrap can make the system fetch the full patch, but it follows the
-package's storage/master title id and can create a duplicate/ghost title for
-cross-region updates. PatchDL therefore prefers the Sony `manifest_url`,
-downloads every listed `pieces[]` entry in order, and concatenates them into one
-local `.pkg` before handing it to AppInstUtil. The `delta_url` title id is kept
-only as the storage/master-id diagnostic.
+All writes stay under `/data/patchdl`. PatchDL never writes to the system
+partition and never touches firmware.
+
+## Settings
+
+Settings persist to `/data/patchdl/config.json` and survive a restart:
+
+- Default policy (allow or deny) and a per-game enable toggle.
+- Install after download, as a global default with a per-game override.
+- Delete the PKG after a successful install.
+- Verify downloaded pieces (SHA-256).
+- Parallel download connections (1 to 16), applied live.
 
 ## Build
 
-Requires `ps5-payload-dev/sdk`. The network and install features also need the
-prebuilt libcurl + OpenSSL from `ps5-payload-dev/pacbrew-repo` placed in the SDK
-sysroot (`target/user/homebrew`); `scripts/build_ps5.sh` enables them
-automatically when present. libmicrohttpd is vendored under `vendor/etahen`, and
-SQLite is vendored under `vendor/sqlite`.
+Requires `ps5-payload-dev/sdk`. The network and install features need the
+prebuilt libcurl + OpenSSL from `ps5-payload-dev/pacbrew-repo` in the SDK sysroot
+(`target/user/homebrew`); `scripts/build_ps5.sh` enables them when present.
+libmicrohttpd is vendored under `vendor/etahen`, SQLite under `vendor/sqlite`.
 
 ```sh
 scripts/build_ps5.sh        # produces patchdl-ps5.elf
@@ -63,9 +87,9 @@ scripts/build_ps5.sh        # produces patchdl-ps5.elf
 
 ## Deploy
 
-This console uses the BD-JB autoloader with itsPLK's Payload Manager on port
-8084 (not a 9021 elfldr). `scripts/deploy_ps5.sh` uploads the ELF named with its
-version and launches it; the payload replaces any running instance itself.
+This console uses the BD-JB autoloader with itsPLK's Payload Manager on port 8084
+(not a 9021 elfldr). `scripts/deploy_ps5.sh` uploads the version-named ELF and
+launches it; the payload replaces any running instance.
 
 ```sh
 PS5_HOST=<console-ip> scripts/deploy_ps5.sh
@@ -79,17 +103,21 @@ http://<console-ip>:12880/
 
 ## Status
 
-0.0.3, early. Title scan, source classification, version resolution,
-firmware-compatibility filtering, target/storage-id handling, and the local
-AppInstUtil HTTP stream have been verified on firmware 11.60. PatchDL now
-downloads PS5 update manifests as merged piece packages under `/data/patchdl`;
-large retail updates can be tens of GB. The download queue shows live progress,
-and each download can be cancelled (the partial file is deleted) or a finished
-package deleted again, from the queue or the title card. Manifest pieces are
-verified in offset order and against their declared size while merging. Open
-items: a full large-title manifest download/install still needs an end-to-end
-run, the web UI marks a title "Installing…" but reads progress from the PS5's
-own notifications rather than a percentage, and disc-based games need the disc
-inserted for their patch to apply (a normal Sony requirement).
-Settings (global policy and the per-game toggle) persist to
-`/data/patchdl/config.json` and survive a restart.
+Verified on firmware 11.60: title scan, source classification, version
+resolution past the nanoDNS block, firmware-compatibility filtering, the parallel
+download pool, reboot-safe resume, and on-device SHA-256 verification. A full
+Dead Island 2 update (61.6 GB) downloaded and verified byte-perfect across
+several reboots.
+
+Install works for same-region patches, where Sony stores the patch bytes under
+the installed game's own title id.
+
+Cross-region patches are a known limitation. Sony sometimes packages a regional
+patch under a different (master) storage title and ships it as a debug-magic
+container. PatchDL downloads such a patch and verifies it against Sony's hashes,
+but the on-console installer (`InstallByPackage`) rejects it on 11.60, and the
+homebrew alternative (BGFT register) returns "not supported" outside the system
+process. Installing that class of patch needs Sony's authenticated updater, which
+nanoDNS blocks. The web UI marks a title "Installing…" and reads progress from the
+PS5's own notifications. Disc games need the disc inserted for their patch to
+apply, which is a normal Sony requirement.
