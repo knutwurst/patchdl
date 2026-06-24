@@ -797,6 +797,8 @@ verxml_fetch_thread(void *arg) {
                 sizeof(t->latest_required_fw) - 1);
         strncpy(t->patch_url,          info.compatible_url,
                 sizeof(t->patch_url) - 1);
+        strncpy(t->delta_url,          info.delta_url,
+                sizeof(t->delta_url) - 1);
         strncpy(t->patch_title_id,     info.compatible_title,
                 sizeof(t->patch_title_id) - 1);
         strncpy(t->patch_storage_title_id, info.compatible_storage_title,
@@ -818,6 +820,7 @@ verxml_fetch_thread(void *arg) {
 static int
 get_title_action_info(const char *title_id, patchdl_source_t *src,
                       char *patch_url, size_t url_sz,
+                      char *delta_url, size_t durl_sz,
                       char *patch_title_id, size_t pt_sz,
                       char *patch_storage_title_id, size_t pst_sz,
                       char *content_id, size_t ci_sz,
@@ -832,6 +835,8 @@ get_title_action_info(const char *title_id, patchdl_source_t *src,
             *src = g_titles[i].source_type;
             strncpy(patch_url, g_titles[i].patch_url, url_sz - 1);
             patch_url[url_sz - 1] = '\0';
+            strncpy(delta_url, g_titles[i].delta_url, durl_sz - 1);
+            delta_url[durl_sz - 1] = '\0';
             strncpy(patch_title_id, g_titles[i].patch_title_id, pt_sz - 1);
             patch_title_id[pt_sz - 1] = '\0';
             strncpy(patch_storage_title_id, g_titles[i].patch_storage_title_id, pst_sz - 1);
@@ -1377,10 +1382,12 @@ dl_worker(void *arg) {
 /* ---------- HTTP handlers (enqueue/pause/cancel) ------------------------ */
 
 /* Enqueue a download. Returns 202 immediately; the pool admits + downloads it
-   across N connections. De-dupes by title_id; resumes a paused job. */
+   across N connections. De-dupes by title_id; resumes a paused job.
+   When patch_url is a manifest JSON and delta_url is set, downloads the DP.pkg
+   bootstrap directly (44 MB) instead of the multi-piece 66 GB split package. */
 static enum MHD_Result
 do_download(struct MHD_Connection *conn, const char *title_id,
-            patchdl_source_t src, const char *patch_url,
+            patchdl_source_t src, const char *patch_url, const char *delta_url,
             const char *name, const char *version, int enabled) {
     dl_job_t *job, *existing = NULL;
     int       count = 0, verify;
@@ -1449,10 +1456,13 @@ do_download(struct MHD_Connection *conn, const char *title_id,
     snprintf(job->title_id, sizeof job->title_id, "%s", title_id);
     snprintf(job->name, sizeof job->name, "%s", name && name[0] ? name : title_id);
     snprintf(job->version, sizeof job->version, "%s", version ? version : "");
-    snprintf(job->manifest_url, sizeof job->manifest_url, "%s", patch_url);
-    snprintf(job->dir, sizeof job->dir, "%s/%s", PATCHDL_DL_DIR, title_id);
-    title_pkg_path(title_id, patch_url, job->dest, sizeof job->dest);
-    job->is_manifest = url_is_manifest(patch_url);
+
+    {
+        snprintf(job->manifest_url, sizeof job->manifest_url, "%s", patch_url);
+        snprintf(job->dir, sizeof job->dir, "%s/%s", PATCHDL_DL_DIR, title_id);
+        title_pkg_path(title_id, patch_url, job->dest, sizeof job->dest);
+        job->is_manifest = url_is_manifest(patch_url);
+    }
     job->verify = verify;
     job->state = JOB_QUEUED;
     job->fd = -1;
@@ -1542,10 +1552,10 @@ do_cancel(struct MHD_Connection *conn, const char *title_id) {
 
 static enum MHD_Result
 do_install(struct MHD_Connection *conn, const char *title_id,
-           patchdl_source_t src, const char *patch_url,
+           patchdl_source_t src, const char *patch_url, const char *delta_url,
            const char *patch_title_id, const char *patch_storage_title_id,
            const char *content_id, int enabled) {
-    char dest[320], msg[256], resp[640];
+    char dest[320], msg[256], resp[720];
     int  rc;
 
     if (!enabled)
@@ -1558,13 +1568,11 @@ do_install(struct MHD_Connection *conn, const char *title_id,
         return queue_json(conn, MHD_HTTP_FORBIDDEN,
                           "{\"ok\":false,\"reason\":\"install_not_allowed_for_source\"}");
 
-    if (!patch_url[0])
+    if (!patch_url[0] && !delta_url[0])
         return queue_json(conn, MHD_HTTP_CONFLICT,
                           "{\"ok\":false,\"reason\":\"no_compatible_patch\"}");
 
-    /* GUARD (app layer): the version.xml target title id must match the game.
-       CDN storage under a different regional/master id is valid and has
-       already been normalized by patchdl_verxml. */
+    /* GUARD (app layer): the version.xml target title id must match the game. */
     if (patch_title_id[0] && strncmp(patch_title_id, title_id, 9) != 0) {
         snprintf(resp, sizeof(resp),
                  "{\"ok\":false,\"reason\":\"patch_title_mismatch\","
@@ -1572,21 +1580,39 @@ do_install(struct MHD_Connection *conn, const char *title_id,
                  patch_title_id, title_id);
         return queue_json_owned(conn, MHD_HTTP_CONFLICT, strdup(resp));
     }
+
+    /* Shared-master: CDN stores the patch under a different regional title id.
+       The assembled PKG (from the manifest download) embeds the game's own
+       content_id, so AppInstUtil routes the install to the right title slot.
+       sceAppInstUtilInstallByPackage is unavailable in our process context
+       (0x80B21163), so only sceAppInstUtilAppInstallPkg works here. */
     if (patch_storage_title_id[0] &&
         strncmp(patch_storage_title_id, title_id, 9) != 0) {
+        char        assembled_local[320] = {0};
+        struct stat assembled_st;
+
+        title_pkg_path(title_id, patch_url, assembled_local, sizeof(assembled_local));
+        if (!assembled_local[0] || stat(assembled_local, &assembled_st) != 0) {
+            snprintf(resp, sizeof(resp),
+                     "{\"ok\":false,\"reason\":\"pkg_not_downloaded\","
+                     "\"hint\":\"download_required\",\"path\":\"%.319s\"}",
+                     assembled_local);
+            return queue_json_owned(conn, MHD_HTTP_CONFLICT, strdup(resp));
+        }
+
+        rc = patchdl_install_app_pkg(assembled_local, title_id, content_id,
+                                     msg, sizeof(msg));
         snprintf(resp, sizeof(resp),
-                 "{\"ok\":false,\"reason\":\"cross_region_storage_unsupported\","
-                 "\"patch_storage_title_id\":\"%.15s\",\"title_id\":\"%.15s\","
-                 "\"message\":\"Patch bytes are signed for a shared master title; "
-                 "standalone AppInstUtil cannot retarget them on 11.60\"}",
-                 patch_storage_title_id, title_id);
-        return queue_json_owned(conn, MHD_HTTP_CONFLICT, strdup(resp));
+                 "{\"ok\":%s,\"rc\":%d,\"message\":\"%s\",\"path\":\"%.319s\"}",
+                 rc == 0 ? "true" : "false", rc, msg, assembled_local);
+        return queue_json_owned(conn,
+                                rc == 0 ? MHD_HTTP_OK : MHD_HTTP_BAD_GATEWAY,
+                                strdup(resp));
     }
 
     title_pkg_path(title_id, patch_url, dest, sizeof(dest));
 
-    rc = patchdl_install_local_pkg(dest, title_id, patch_storage_title_id,
-                                   content_id, msg, sizeof(msg));
+    rc = patchdl_install_app_pkg(dest, title_id, content_id, msg, sizeof(msg));
     snprintf(resp, sizeof(resp),
              "{\"ok\":%s,\"rc\":%d,\"message\":\"%s\",\"path\":\"%s\"}",
              rc == 0 ? "true" : "false", rc, msg, dest);
@@ -1624,6 +1650,7 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
     char             title_id[32];
     char             action[24];
     char             patch_url[512] = {0};
+    char             delta_url[512] = {0};
     char             patch_title_id[16] = {0};
     char             patch_storage_title_id[16] = {0};
     char             content_id[64] = {0};
@@ -1644,7 +1671,9 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
     if (!path_segment_safe(title_id))
         return queue_text(conn, MHD_HTTP_FORBIDDEN, "forbidden");
 
-    if (!get_title_action_info(title_id, &src, patch_url, sizeof(patch_url),
+    if (!get_title_action_info(title_id, &src,
+                               patch_url, sizeof(patch_url),
+                               delta_url, sizeof(delta_url),
                                patch_title_id, sizeof(patch_title_id),
                                patch_storage_title_id,
                                sizeof(patch_storage_title_id),
@@ -1661,7 +1690,8 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
         return set_title_enabled(conn, title_id, 0);
 
     if (!strcmp(action, "download"))
-        return do_download(conn, title_id, src, patch_url, name, version, enabled);
+        return do_download(conn, title_id, src, patch_url, delta_url,
+                           name, version, enabled);
 
     if (!strcmp(action, "cancel"))
         return do_cancel(conn, title_id);
@@ -1674,8 +1704,9 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
                           "{\"ok\":true,\"queued\":true,\"action\":\"check\"}");
 
     if (!strcmp(action, "install"))
-        return do_install(conn, title_id, src, patch_url, patch_title_id,
-                          patch_storage_title_id, content_id, enabled);
+        return do_install(conn, title_id, src, patch_url, delta_url,
+                          patch_title_id, patch_storage_title_id,
+                          content_id, enabled);
 
     return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
 }
@@ -1780,6 +1811,46 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
             return handle_config_post(conn, body);
         if (!strncmp(url, "/api/titles/", 12))
             return handle_title_action(conn, url);
+        if (!strcmp(url, "/api/install_uri")) {
+            char uri[768] = {0}, cid[64] = {0}, tid[32] = {0};
+            char msg[256], resp[1100];
+            int rc;
+            json_get_str(body, "uri", uri, sizeof(uri));
+            json_get_str(body, "content_id", cid, sizeof(cid));
+            json_get_str(body, "title_id", tid, sizeof(tid));
+            if (!uri[0])
+                return queue_json(conn, MHD_HTTP_BAD_REQUEST,
+                                  "{\"ok\":false,\"reason\":\"uri required\"}");
+            rc = patchdl_install_by_uri(uri, tid[0] ? tid : NULL,
+                                        cid[0] ? cid : NULL, msg, sizeof(msg));
+            snprintf(resp, sizeof(resp),
+                     "{\"ok\":%s,\"rc\":%d,\"rc_hex\":\"0x%08x\",\"message\":\"%s\","
+                     "\"uri\":\"%.511s\",\"content_id\":\"%.63s\",\"title_id\":\"%.31s\"}",
+                     rc == 0 ? "true" : "false", rc, (unsigned)rc, msg,
+                     uri, cid, tid);
+            return queue_json_owned(conn, rc == 0 ? MHD_HTTP_OK : MHD_HTTP_BAD_GATEWAY,
+                                    strdup(resp));
+        }
+        if (!strcmp(url, "/api/install_aip")) {
+            char path[768] = {0}, cid[64] = {0}, tid[32] = {0};
+            char msg[256], resp[1100];
+            int rc;
+            json_get_str(body, "path", path, sizeof(path));
+            json_get_str(body, "content_id", cid, sizeof(cid));
+            json_get_str(body, "title_id", tid, sizeof(tid));
+            if (!path[0])
+                return queue_json(conn, MHD_HTTP_BAD_REQUEST,
+                                  "{\"ok\":false,\"reason\":\"path required\"}");
+            rc = patchdl_install_app_pkg(path, tid[0] ? tid : NULL,
+                                         cid[0] ? cid : NULL, msg, sizeof(msg));
+            snprintf(resp, sizeof(resp),
+                     "{\"ok\":%s,\"rc\":%d,\"rc_hex\":\"0x%08x\",\"message\":\"%s\","
+                     "\"path\":\"%.511s\",\"content_id\":\"%.63s\",\"title_id\":\"%.31s\"}",
+                     rc == 0 ? "true" : "false", rc, (unsigned)rc, msg,
+                     path, cid, tid);
+            return queue_json_owned(conn, rc == 0 ? MHD_HTTP_OK : MHD_HTTP_BAD_GATEWAY,
+                                    strdup(resp));
+        }
         return queue_text(conn, MHD_HTTP_NOT_FOUND, "not found");
     }
 
@@ -1823,6 +1894,12 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         return queue_json_owned(conn, MHD_HTTP_OK, strdup(p));
     }
 
+    if (!strcmp(url, "/api/debug_install")) {
+        char p[512];
+        patchdl_install_debug_state(p, sizeof(p));
+        return queue_json_owned(conn, MHD_HTTP_OK, strdup(p));
+    }
+
     if (!strcmp(url, "/api/pkgdiag"))
         return queue_json(conn, MHD_HTTP_OK, g_pkg_diag_json);
 
@@ -1831,13 +1908,16 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
        assembled .pkg can be verified against Sony's own hashes. No install. */
     if (!strncmp(url, "/api/manifest/", 14)) {
         const char      *tid = url + 14;
-        char             purl[768] = {0}, pti[32], psti[32], cid[64], nm[128], ver[16];
+        char             purl[768] = {0}, durl_[512] = {0};
+        char             pti[32], psti[32], cid[64], nm[128], ver[16];
         patchdl_source_t src;
         int              en;
         patchdl_manifest_t mf;
         jbuf_t           j = {0};
 
-        if (!get_title_action_info(tid, &src, purl, sizeof purl, pti, sizeof pti,
+        if (!get_title_action_info(tid, &src, purl, sizeof purl,
+                                   durl_, sizeof durl_,
+                                   pti, sizeof pti,
                                    psti, sizeof psti, cid, sizeof cid,
                                    nm, sizeof nm, ver, sizeof ver, &en) || !purl[0])
             return queue_json(conn, MHD_HTTP_NOT_FOUND,
@@ -1864,14 +1944,17 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
        install. Hashing runs on-device (SSD), so no multi-GB transfer. */
     if (!strncmp(url, "/api/pkgverify/", 15)) {
         const char        *tid = url + 15;
-        char               purl[768] = {0}, pti[32], psti[32], cid[64], nm[128], ver[16];
+        char               purl[768] = {0}, durl_[512] = {0};
+        char               pti[32], psti[32], cid[64], nm[128], ver[16];
         char               dest[320];
         patchdl_source_t   src;
         int                en, fd, okc = 0, badc = 0, first_bad = -1;
         patchdl_manifest_t mf;
         jbuf_t             j = {0};
 
-        if (!get_title_action_info(tid, &src, purl, sizeof purl, pti, sizeof pti,
+        if (!get_title_action_info(tid, &src, purl, sizeof purl,
+                                   durl_, sizeof durl_,
+                                   pti, sizeof pti,
                                    psti, sizeof psti, cid, sizeof cid,
                                    nm, sizeof nm, ver, sizeof ver, &en) || !purl[0])
             return queue_json(conn, MHD_HTTP_NOT_FOUND,
@@ -1912,12 +1995,15 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
        (installed app) ids, to expose the cross-region linkage. No install. */
     if (!strncmp(url, "/api/pkgmeta/", 13)) {
         const char      *tid = url + 13;
-        char             purl[768] = {0}, pti[32], psti[32], cid[64], nm[128], ver[16];
+        char             purl[768] = {0}, durl_[512] = {0};
+        char             pti[32], psti[32], cid[64], nm[128], ver[16];
         char             dest[320], ecid[64] = {0}, etid[48] = {0}, msg[128], resp[900];
         patchdl_source_t src;
         int              en, is_app = 0, rc;
 
-        if (!get_title_action_info(tid, &src, purl, sizeof purl, pti, sizeof pti,
+        if (!get_title_action_info(tid, &src, purl, sizeof purl,
+                                   durl_, sizeof durl_,
+                                   pti, sizeof pti,
                                    psti, sizeof psti, cid, sizeof cid,
                                    nm, sizeof nm, ver, sizeof ver, &en) || !purl[0])
             return queue_json(conn, MHD_HTTP_NOT_FOUND, "{\"error\":\"unknown title\"}");

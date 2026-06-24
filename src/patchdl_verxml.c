@@ -148,6 +148,8 @@ parse_packages(const char *xml, uint32_t fw_bin, patchdl_verinfo_t *out) {
                             sizeof(out->compatible_version) - 1);
                     strncpy(out->compatible_url, murl[0] ? murl : durl,
                             sizeof(out->compatible_url) - 1);
+                    if (durl[0])
+                        strncpy(out->delta_url, durl, sizeof(out->delta_url) - 1);
                     extract_title_id(durl, out->compatible_storage_title,
                                      sizeof(out->compatible_storage_title));
                     if (root_title[0]) {

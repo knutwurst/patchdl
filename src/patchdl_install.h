@@ -42,3 +42,25 @@ int patchdl_install_pkg_meta(const char *local_path, char *content_id, size_t ci
 /* Read-only: report the last AppInstUtil install task PatchDL started, using
    sceAppInstUtilGetInstallStatus when present. No install, no mutation. */
 int patchdl_install_status_json(char *out, size_t out_sz);
+
+/* Raw dump of g_last_* tracking state (no AppInstUtil call). For diagnosis. */
+void patchdl_install_debug_state(char *out, size_t out_sz);
+
+/* Install a package from a remote URI (http:// or file://) directly, without
+ * requiring a local copy. Used for shared-master delta packages where the
+ * version.xml targets a different title id than the CDN storage path.
+ * `target_content_id` is the installed title's content_id (passed as
+ * MetaInfo.content_id so AppInstUtil binds the install to the right title).
+ */
+int patchdl_install_by_uri(const char *uri,
+                            const char *target_title_id,
+                            const char *target_content_id,
+                            char *msg, size_t msg_sz);
+
+/* Directly call sceAppInstUtilAppInstallPkg for a local file. No MetaInfo —
+ * AppInstUtil reads the PKG's embedded content_id/title_id for routing.
+ * Use when InstallByPackage is unavailable (privilege). */
+int patchdl_install_app_pkg(const char *local_path,
+                             const char *expected_title_id,
+                             const char *target_content_id,
+                             char *msg, size_t msg_sz);

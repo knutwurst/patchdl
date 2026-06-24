@@ -64,6 +64,7 @@ typedef struct {
     ai_install_error_t error_info;
     int32_t            local_copy_percent;
     bool               is_copy_only;
+    char               _pad[2048]; /* safety margin — actual Sony struct may be larger */
 } ai_install_status_t;
 
 #define STATIC_ASSERT(c, n) typedef char static_assert_##n[(c) ? 1 : -1]
@@ -87,7 +88,7 @@ typedef int (*ai_install_by_pkg_fn)(ai_meta_info_t *meta, ai_pkg_info_t *info,
                                     ai_playgo_info_t *playgo);
 typedef int (*ai_title_from_pkg_fn)(const char *path, char *title_id, int *is_app);
 typedef int (*ai_content_from_pkg_fn)(const char *path, char *content_id, int *is_app);
-typedef int (*ai_get_status_fn)(const char *content_id, ai_install_status_t *status);
+typedef int (*ai_get_status_fn)(char *content_id_out, ai_install_status_t *status);
 
 static ai_init_fn             ai_initialize;
 static ai_install_pkg_fn      ai_install_pkg;
@@ -407,6 +408,32 @@ patchdl_install_pkg_meta(const char *local_path, char *content_id, size_t cid_sz
     return ok ? 0 : -1;
 }
 
+void
+patchdl_install_debug_state(char *out, size_t out_sz) {
+    char cid[AI_CONTENTID_SIZE];
+    char tid[32], method[32];
+    int  start_rc;
+    int  stage;
+
+    pthread_mutex_lock(&g_mtx);
+    memcpy(cid, g_last_content_id, sizeof(cid));
+    snprintf(tid,    sizeof(tid),    "%s", g_last_target_title_id);
+    snprintf(method, sizeof(method), "%s", g_last_method);
+    start_rc = g_last_start_rc;
+    stage    = g_stage;
+    pthread_mutex_unlock(&g_mtx);
+
+    snprintf(out, out_sz,
+             "{\"stage\":%d,\"cid_len\":%d,\"cid_hex\":\"%02x%02x%02x%02x\","
+             "\"content_id\":\"%s\",\"target_title_id\":\"%s\","
+             "\"method\":\"%s\",\"start_rc\":%d}",
+             stage,
+             (int)strnlen(cid, sizeof(cid)),
+             (unsigned char)cid[0], (unsigned char)cid[1],
+             (unsigned char)cid[2], (unsigned char)cid[3],
+             cid, tid, method, start_rc);
+}
+
 int
 patchdl_install_status_json(char *out, size_t out_sz) {
     char cid[AI_CONTENTID_SIZE];
@@ -452,8 +479,15 @@ patchdl_install_status_json(char *out, size_t out_sz) {
         return -1;
     }
 
-    memset(&st, 0, sizeof(st));
-    rc = ai_get_status(cid, &st);
+    /* sceAppInstUtilGetInstallStatus(char *content_id_out, status_t *status):
+       first arg is an OUTPUT buffer that receives the current install's content_id.
+       Do NOT pass `cid` there — it would be overwritten. Use a fresh buffer. */
+    {
+        char ai_cid_out[AI_CONTENTID_SIZE] = {0};
+        memset(&st, 0, sizeof(st));
+        rc = ai_get_status(ai_cid_out, &st);
+        (void)ai_cid_out; /* returned content_id for future use */
+    }
     copy_bounded(status, sizeof(status), st.status, sizeof(st.status));
     copy_bounded(src_type, sizeof(src_type), st.src_type, sizeof(st.src_type));
     if (st.total_size > 0)
@@ -538,18 +572,11 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
                  pkg_tid, expected_title_id);
         return -1;
     }
-    if (pkg_tid_mismatch) {
-        snprintf(msg, msg_sz,
-                 "unsupported shared-master package (pkg %.12s, target %.12s): "
-                 "standalone AppInstUtil cannot retarget signed patch metadata",
-                 pkg_tid, expected_title_id ? expected_title_id : "");
-        return -1;
-    }
-
-    /* Preferred path: etaHEN's DPI uses InstallByPackage with an empty
-       MetaInfo.content_id and lets AppInstUtil bind to the signed package
-       metadata. Passing the installed game's content id is NOT a retarget
-       override for shared-master regional bytes; those are refused above. */
+    /* Preferred path: etaHEN's DPI uses InstallByPackage with the installed
+       game's content_id in MetaInfo so AppInstUtil binds the install to the
+       right title slot. For shared-master cross-region packages the pkg bytes
+       carry a different title id than the installed game; passing content_id
+       is what etaHEN does to route the install correctly. */
     {
         char             file_uri[1100];
         char             http_loop_uri[1200] = {0};
@@ -588,7 +615,11 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         uris[3]                 = http_lan_uri[0] ? http_lan_uri : NULL;
         meta.ex_uri             = "";
         meta.playgo_scenario_id = "";
-        meta.content_id         = "";
+        /* For cross-region shared-master packages pass the installed game's
+           content_id so AppInstUtil binds the download to the right title. */
+        meta.content_id         = (pkg_tid_mismatch &&
+                                    target_content_id && target_content_id[0])
+                                   ? target_content_id : "";
         meta.content_name       = "PatchDL";
         meta.icon_url           = "";
 
@@ -616,32 +647,122 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
                 }
             }
             rc = rc2;
-            if (pkg_tid_mismatch) {
-                snprintf(msg, msg_sz,
-                         "install rejected (pkg %.12s -> %.12s; tries: %s)",
-                         pkg_tid, expected_title_id ? expected_title_id : "", tries);
-                return rc ? rc : -1;
-            }
         }
     }
 
-    /* Last resort for normal same-title packages only. This path has no target
-       metadata parameter, so it is intentionally skipped for shared-master
-       region bytes. */
+    /* AppInstallPkg: simpler API, no MetaInfo content_id override. Tried for
+       all packages including cross-region, since it may have different
+       privilege requirements than InstallByPackage. For shared-master packages
+       it will bind to the pkg's own embedded title, not the expected_title_id,
+       so treat success with caution; also report the complete error set. */
     {
+        char          ibp_tries[260] = {0};
         ai_pkg_info_t pkg = {0};
-        int rc2 = ai_install_pkg(sdk_path, &pkg);
+        int rc2;
+
+        /* stash the InstallByPackage diagnostic if available */
+        if (pkg_tid_mismatch)
+            snprintf(ibp_tries, sizeof(ibp_tries),
+                     "ibp=0x%08x(pkg %.12s->%.12s)",
+                     (unsigned)rc, pkg_tid,
+                     expected_title_id ? expected_title_id : "");
+
+        rc2 = ai_install_pkg(sdk_path, &pkg);
         if (rc2 == 0) {
             remember_install(expected_title_id, "AppInstallPkg",
                              &pkg, target_content_id, rc2);
-            snprintf(msg, msg_sz, "install started (AppInstallPkg, content %.47s)",
+            snprintf(msg, msg_sz, "install started (AppInstallPkg, content %.47s%s%s)",
                      pkg.content_id[0] ? pkg.content_id :
-                     (target_content_id ? target_content_id : ""));
+                     (target_content_id ? target_content_id : ""),
+                     ibp_tries[0] ? " " : "", ibp_tries);
             return 0;
         }
-        snprintf(msg, msg_sz,
-                 "install rejected (InstallByPackage=0x%08x, AppInstallPkg=0x%08x)",
-                 (unsigned)rc, (unsigned)rc2);
+        if (pkg_tid_mismatch)
+            snprintf(msg, msg_sz,
+                     "install rejected (pkg %.12s->%.12s ibp=0x%08x aip=0x%08x)",
+                     pkg_tid, expected_title_id ? expected_title_id : "",
+                     (unsigned)rc, (unsigned)rc2);
+        else
+            snprintf(msg, msg_sz,
+                     "install rejected (InstallByPackage=0x%08x, AppInstallPkg=0x%08x)",
+                     (unsigned)rc, (unsigned)rc2);
         return rc2 ? rc2 : (rc ? rc : -1);
     }
+}
+
+int
+patchdl_install_by_uri(const char *uri, const char *target_title_id,
+                       const char *target_content_id,
+                       char *msg, size_t msg_sz) {
+    ai_meta_info_t   meta   = {0};
+    ai_pkg_info_t    pkg    = {0};
+    ai_playgo_info_t playgo = {0};
+    int rc;
+
+    if (!uri || !uri[0]) {
+        snprintf(msg, msg_sz, "no uri");
+        return -1;
+    }
+    backend_start();
+    if (g_stage != 5) {
+        snprintf(msg, msg_sz, "install backend not ready: %s", stage_str(g_stage));
+        return -1;
+    }
+
+    meta.uri                = uri;
+    meta.ex_uri             = "";
+    meta.playgo_scenario_id = "";
+    meta.content_id         = target_content_id ? target_content_id : "";
+    meta.content_name       = "PatchDL";
+    meta.icon_url           = "";
+
+    rc = ai_install_by_package(&meta, &pkg, &playgo);
+    remember_install(target_title_id, "InstallByURI", &pkg, target_content_id, rc);
+
+    if (rc == 0) {
+        snprintf(msg, msg_sz, "install started (InstallByPackage/uri, content %.47s)",
+                 pkg.content_id[0] ? pkg.content_id :
+                 (target_content_id ? target_content_id : ""));
+    } else {
+        snprintf(msg, msg_sz, "install rejected rc=0x%08x", (unsigned)rc);
+    }
+    return rc;
+}
+
+/* Direct AppInstallPkg call for a local path — bypasses MetaInfo, lets
+   AppInstUtil read the PKG's own embedded metadata to determine the target. */
+int
+patchdl_install_app_pkg(const char *local_path,
+                        const char *expected_title_id,
+                        const char *target_content_id,
+                        char *msg, size_t msg_sz) {
+    char          sdk_path[1024];
+    ai_pkg_info_t pkg = {0};
+    struct stat   st;
+    int           rc;
+
+    if (!local_path || !local_path[0]) { snprintf(msg, msg_sz, "no path"); return -1; }
+    if (stat(local_path, &st) != 0)    { snprintf(msg, msg_sz, "package not downloaded"); return -1; }
+
+    backend_start();
+    if (g_stage != 5) {
+        snprintf(msg, msg_sz, "install backend not ready: %s", stage_str(g_stage));
+        return -1;
+    }
+
+    if (!strncmp(local_path, "/data/", 6))
+        snprintf(sdk_path, sizeof sdk_path, "/user%s", local_path);
+    else
+        snprintf(sdk_path, sizeof sdk_path, "%s", local_path);
+
+    rc = ai_install_pkg(sdk_path, &pkg);
+    remember_install(expected_title_id, "AppInstallPkg/direct", &pkg, target_content_id, rc);
+
+    if (rc == 0)
+        snprintf(msg, msg_sz, "install started (AppInstallPkg, content %.47s)",
+                 pkg.content_id[0] ? pkg.content_id :
+                 (target_content_id ? target_content_id : ""));
+    else
+        snprintf(msg, msg_sz, "install rejected rc=0x%08x", (unsigned)rc);
+    return rc;
 }

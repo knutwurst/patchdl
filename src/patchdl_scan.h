@@ -24,6 +24,7 @@ typedef struct {
     char             latest_version[16];
     char             latest_required_fw[16];
     char             patch_url[512];   /* manifest_url if present, otherwise pkg URL */
+    char             delta_url[512];   /* DP.pkg bootstrap URL (always a PKG) */
     char             patch_title_id[16]; /* target title id from version.xml */
     char             patch_storage_title_id[16]; /* title id embedded in delta_url */
     int              verxml_done;
