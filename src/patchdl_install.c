@@ -67,6 +67,13 @@ typedef struct {
     char               _pad[2048]; /* safety margin — actual Sony struct may be larger */
 } ai_install_status_t;
 
+/* Padded buffers for Sony output writes whose actual size is reverse-engineered.
+   The visible content fits in 0x30 (content_id) / 16 (title_id) bytes, but the
+   firmware may NUL-pad or write more. Used as caller-side temporaries that are
+   then copy_bounded()-d into the right-sized destination. */
+#define AI_CONTENTID_OUT_SIZE    256
+#define AI_TITLEID_OUT_SIZE      128
+
 #define STATIC_ASSERT(c, n) typedef char static_assert_##n[(c) ? 1 : -1]
 STATIC_ASSERT(sizeof(ai_pkg_info_t) == 0x38, pkg_info_size);
 STATIC_ASSERT(sizeof(ai_meta_info_t) == (6 * sizeof(void *)), meta_info_size);
@@ -157,6 +164,32 @@ copy_bounded(char *dst, size_t dst_sz, const char *src, size_t src_sz) {
     for (n = 0; n + 1 < dst_sz && n < src_sz && src[n]; n++)
         dst[n] = src[n];
     dst[n] = '\0';
+}
+
+/* Conservative whitelist for ids/filenames that we extract from a local path
+   and inject into URIs/log lines passed to AppInstUtil. Rejects CRLF, '/',
+   '\\', NUL, control chars, anything that could change URI semantics. */
+static int
+install_id_safe(const char *s) {
+    if (!s || !s[0]) return 0;
+    for (const char *p = s; *p; p++) {
+        if (!((*p >= 'A' && *p <= 'Z') ||
+              (*p >= 'a' && *p <= 'z') ||
+              (*p >= '0' && *p <= '9') ||
+              *p == '_' || *p == '-' || *p == '.'))
+            return 0;
+    }
+    return 1;
+}
+
+/* Exact match for PS4/PS5 title ids (9 chars: 4 letters + 5 digits). A bare
+   strncmp(...,9) would also match longer ids that share a 9-char prefix and
+   could collide PPSA12345 with PPSA12345EVIL. */
+static int
+title_id_eq9(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    if (strnlen(a, 16) != 9 || strnlen(b, 16) != 9) return 0;
+    return strncmp(a, b, 9) == 0;
 }
 
 static void
@@ -365,7 +398,10 @@ patchdl_install_pkg_meta(const char *local_path, char *content_id, size_t cid_sz
                          char *title_id, size_t tid_sz, int *is_app,
                          char *msg, size_t msg_sz) {
     char        sdk_path[1024];
-    char        cid[64] = {0}, tid[48] = {0};
+    /* Padded output buffers — Sony's GetContentIdFromPkg / GetTitleIdFromPkg
+       take no length hint; firmware may NUL-pad more than the visible id. */
+    char        cid[AI_CONTENTID_OUT_SIZE] = {0};
+    char        tid[AI_TITLEID_OUT_SIZE]   = {0};
     int         app_c = 0, app_t = 0, ok = 0;
     struct stat st;
 
@@ -389,19 +425,13 @@ patchdl_install_pkg_meta(const char *local_path, char *content_id, size_t cid_sz
 
     if (ai_content_from_pkg &&
         ai_content_from_pkg(sdk_path, cid, &app_c) == 0 && cid[0]) {
-        if (content_id && cid_sz) {
-            strncpy(content_id, cid, cid_sz - 1);
-            content_id[cid_sz - 1] = '\0';
-        }
+        copy_bounded(content_id, cid_sz, cid, sizeof(cid));
         if (is_app) *is_app = app_c;
         ok = 1;
     }
     if (ai_title_from_pkg &&
         ai_title_from_pkg(sdk_path, tid, &app_t) == 0 && tid[0]) {
-        if (title_id && tid_sz) {
-            strncpy(title_id, tid, tid_sz - 1);
-            title_id[tid_sz - 1] = '\0';
-        }
+        copy_bounded(title_id, tid_sz, tid, sizeof(tid));
         ok = 1;
     }
     snprintf(msg, msg_sz, ok ? "ok" : "could not read pkg metadata");
@@ -481,9 +511,10 @@ patchdl_install_status_json(char *out, size_t out_sz) {
 
     /* sceAppInstUtilGetInstallStatus(char *content_id_out, status_t *status):
        first arg is an OUTPUT buffer that receives the current install's content_id.
-       Do NOT pass `cid` there — it would be overwritten. Use a fresh buffer. */
+       Do NOT pass `cid` there — it would be overwritten. The visible id fits in
+       0x30 bytes but Sony's NUL-pad length is unknown; use a padded buffer. */
     {
-        char ai_cid_out[AI_CONTENTID_SIZE] = {0};
+        char ai_cid_out[AI_CONTENTID_OUT_SIZE] = {0};
         memset(&st, 0, sizeof(st));
         rc = ai_get_status(ai_cid_out, &st);
         (void)ai_cid_out; /* returned content_id for future use */
@@ -555,15 +586,20 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
        such packages to the raw AppInstallPkg path. */
     if (storage_title_id && storage_title_id[0] &&
         expected_title_id && expected_title_id[0] &&
-        strncmp(storage_title_id, expected_title_id, 9) != 0) {
+        !title_id_eq9(storage_title_id, expected_title_id)) {
         pkg_tid_mismatch = 1;
         strncpy(pkg_tid, storage_title_id, sizeof(pkg_tid) - 1);
+        pkg_tid[sizeof(pkg_tid) - 1] = '\0';
     }
     if (ai_title_from_pkg && expected_title_id && expected_title_id[0]) {
+        /* Sony's GetTitleIdFromPkg writes into the output buffer with no length
+           hint — pad generously and copy the safe portion into pkg_tid. */
+        char tid_out[AI_TITLEID_OUT_SIZE] = {0};
         int  is_app = 0;
-        if (ai_title_from_pkg(sdk_path, pkg_tid, &is_app) == 0 && pkg_tid[0] &&
-            strncmp(pkg_tid, expected_title_id, 9) != 0) {
-            pkg_tid_mismatch = 1;
+        if (ai_title_from_pkg(sdk_path, tid_out, &is_app) == 0 && tid_out[0]) {
+            if (!title_id_eq9(tid_out, expected_title_id))
+                pkg_tid_mismatch = 1;
+            copy_bounded(pkg_tid, sizeof(pkg_tid), tid_out, sizeof(tid_out));
         }
     }
     if (pkg_tid_mismatch && (!target_content_id || !target_content_id[0])) {
@@ -599,14 +635,19 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
             if (tlen > 0 && tlen < sizeof(title_id)) {
                 char ip[INET_ADDRSTRLEN] = {0};
                 memcpy(title_id, t, tlen);
-                snprintf(http_loop_uri, sizeof(http_loop_uri),
-                         "http://127.0.0.1:%d/api/pkg/%s/%s",
-                         PATCHDL_HTTP_PORT, title_id, file_base + 1);
-                local_ip(ip, sizeof(ip));
-                if (ip[0])
-                    snprintf(http_lan_uri, sizeof(http_lan_uri),
-                             "http://%s:%d/api/pkg/%s/%s",
-                             ip, PATCHDL_HTTP_PORT, title_id, file_base + 1);
+                /* CRLF/path-injection guard: anything we splice into the loop /
+                   LAN URI lands inside Sony's HTTP request line. Reject ids
+                   or filenames carrying delimiters or control chars. */
+                if (install_id_safe(title_id) && install_id_safe(file_base + 1)) {
+                    snprintf(http_loop_uri, sizeof(http_loop_uri),
+                             "http://127.0.0.1:%d/api/pkg/%s/%s",
+                             PATCHDL_HTTP_PORT, title_id, file_base + 1);
+                    local_ip(ip, sizeof(ip));
+                    if (ip[0])
+                        snprintf(http_lan_uri, sizeof(http_lan_uri),
+                                 "http://%s:%d/api/pkg/%s/%s",
+                                 ip, PATCHDL_HTTP_PORT, title_id, file_base + 1);
+                }
             }
         }
         uris[0]                 = sdk_path;      /* /user/data/... — the allowlisted path */
