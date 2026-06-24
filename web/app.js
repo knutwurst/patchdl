@@ -755,17 +755,20 @@ async function saveConfig() {
 
 /* ---------------- actions (data layer) ---------------- */
 
-// Queue a download for every game that currently has an available, allowed
-// update. The server tolerates duplicate requests (already-queued/active jobs
-// return their existing state), so a second click is harmless. If
-// install_after_download is on, the per-job auto-install pipeline kicks in
-// once each download finishes — no further client action needed.
+// Queue a download for every game that has an available update AND could
+// actually be installed afterwards. Shadowmounts pass isDownloadAllowed but
+// fail isInstallAllowed (their app slot has no real source medium), so a
+// sweep would otherwise pull tens of GB that AppInstUtil will refuse — the
+// user picks those up by hand when the disc is ready. The server tolerates
+// duplicate requests, so a second click is harmless. If install_after_download
+// is on, the per-job auto-install pipeline kicks in once each download
+// finishes — no further client action needed.
 async function updateAll() {
   const targets = state.games.filter((g) =>
-    g.status === "available" && isDownloadAllowed(g) &&
+    g.status === "available" && isInstallAllowed(g) &&
     !g.downloading && !g.downloaded);
   if (!targets.length) {
-    showToast("No updates to queue.");
+    showToast("No installable updates to queue.");
     return;
   }
   showToast(`Queueing ${targets.length} update${targets.length === 1 ? "" : "s"}…`);
