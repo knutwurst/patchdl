@@ -348,7 +348,6 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
     struct stat st;
     int         rc;
     int         pkg_tid_mismatch = 0;
-    const char *last_uri = "";
 
     if (!local_path || !local_path[0]) {
         snprintf(msg, msg_sz, "no package path");
@@ -365,10 +364,11 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         return -1;
     }
 
-    /* AppInstallPkg runs in a sandbox that sees the user partition as
-       /user/data, not /data. InstallByPackage is different: the shell/debug
-       installer path takes the normal /data/... URI, so keep `local_path` for
-       that API and use `sdk_path` only for AppInstallPkg / metadata probes. */
+    /* Sony's installer sees the user partition as /user/data, not /data, and
+       PATH-ALLOWLISTS the URI passed to InstallByPackage: /user/data/ and
+       /mnt/usb are accepted, but a bare /data/... path is REJECTED with
+       0x80B2116F (empirically confirmed by the ps5upload project). So feed the
+       /user/data view of the file to both InstallByPackage and AppInstallPkg. */
     if (!strncmp(local_path, "/data/", 6))
         snprintf(sdk_path, sizeof(sdk_path), "/user%s", local_path);
     else
@@ -413,7 +413,7 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         const char      *title_dir;
         const char      *file_base;
 
-        snprintf(file_uri, sizeof(file_uri), "file://%s", local_path);
+        snprintf(file_uri, sizeof(file_uri), "file://%s", sdk_path);
         title_dir = strstr(local_path, "/data/patchdl/");
         file_base = strrchr(local_path, '/');
         if (title_dir && file_base && file_base > title_dir + strlen("/data/patchdl/")) {
@@ -433,8 +433,8 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
                              ip, PATCHDL_HTTP_PORT, title_id, file_base + 1);
             }
         }
-        uris[0]                 = local_path;
-        uris[1]                 = file_uri;
+        uris[0]                 = sdk_path;      /* /user/data/... — the allowlisted path */
+        uris[1]                 = file_uri;       /* file:///user/data/... */
         uris[2]                 = http_loop_uri[0] ? http_loop_uri : NULL;
         uris[3]                 = http_lan_uri[0] ? http_lan_uri : NULL;
         meta.ex_uri             = "";
@@ -443,28 +443,34 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         meta.content_name       = "PatchDL";
         meta.icon_url           = "";
 
-        for (int i = 0; i < 4; i++) {
-            if (!uris[i]) continue;
-            memset(&pkg, 0, sizeof(pkg));
-            memset(&playgo, 0, sizeof(playgo));
-            meta.uri = uris[i];
-            last_uri = uris[i];
-            rc2 = ai_install_by_package(&meta, &pkg, &playgo);
-            if (rc2 == 0) {
-                snprintf(msg, msg_sz, "install started (InstallByPackage%s)",
-                         pkg_tid_mismatch ? ", shared master bytes" : "");
-                return 0;
+        {
+            char        tries[260] = {0};
+            const char *labels[4]  = { "userdata", "file", "loop", "lan" };
+            for (int i = 0; i < 4; i++) {
+                if (!uris[i]) continue;
+                memset(&pkg, 0, sizeof(pkg));
+                memset(&playgo, 0, sizeof(playgo));
+                meta.uri = uris[i];
+                rc2 = ai_install_by_package(&meta, &pkg, &playgo);
+                {
+                    size_t l = strlen(tries);
+                    snprintf(tries + l, sizeof(tries) - l, "%s%s=0x%08x",
+                             l ? "," : "", labels[i], (unsigned)rc2);
+                }
+                if (rc2 == 0) {
+                    snprintf(msg, msg_sz, "install started (InstallByPackage%s)",
+                             pkg_tid_mismatch ? ", shared master bytes" : "");
+                    return 0;
+                }
+            }
+            rc = rc2;
+            if (pkg_tid_mismatch) {
+                snprintf(msg, msg_sz,
+                         "install rejected (pkg %.12s -> %.12s; tries: %s)",
+                         pkg_tid, expected_title_id ? expected_title_id : "", tries);
+                return rc ? rc : -1;
             }
         }
-        rc = rc2;
-    }
-
-    if (pkg_tid_mismatch) {
-        snprintf(msg, msg_sz,
-                 "install rejected (InstallByPackage=0x%08x, pkg %.12s, target %.12s, uri %.96s)",
-                 (unsigned)rc, pkg_tid, expected_title_id ? expected_title_id : "",
-                 last_uri);
-        return rc ? rc : -1;
     }
 
     /* Last resort for normal same-title packages only. This path has no target
