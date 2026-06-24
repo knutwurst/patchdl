@@ -198,14 +198,14 @@ dns_lookup(const char *host, char *ip_out, size_t ip_sz) {
             return 0;
         }
     }
-    pthread_mutex_unlock(&dns_cache_mtx);
-
+    /* Cold miss: resolve while HOLDING the cache lock (single-flight). N pool
+       workers needing the same CDN host would otherwise each blast Sony's
+       rate-limited resolver; this way one resolves and the rest get the cache.
+       It also serializes dns_resolve so its diagnostic globals can't be raced.
+       (This is the DNS lock, independent of the pool lock.) */
     for (int attempt = 0; attempt < 4 && rc; attempt++)
         rc = dns_resolve(host, ip_out, ip_sz);
-    if (rc) return -1;
-
-    pthread_mutex_lock(&dns_cache_mtx);
-    if (dns_cache_n < (int)(sizeof(dns_cache) / sizeof(dns_cache[0]))) {
+    if (!rc && dns_cache_n < (int)(sizeof(dns_cache) / sizeof(dns_cache[0]))) {
         strncpy(dns_cache[dns_cache_n].host, host,
                 sizeof(dns_cache[0].host) - 1);
         strncpy(dns_cache[dns_cache_n].ip, ip_out,
@@ -213,7 +213,7 @@ dns_lookup(const char *host, char *ip_out, size_t ip_sz) {
         dns_cache_n++;
     }
     pthread_mutex_unlock(&dns_cache_mtx);
-    return 0;
+    return rc;
 }
 
 /* ---------- HTTP GET via curl ------------------------------------------- */
@@ -676,6 +676,204 @@ patchdl_http_download_manifest(const char *manifest_url, const char *dest_path,
                                long long *bytes_out) {
     return patchdl_http_download_manifest_progress(manifest_url, dest_path,
                                                   bytes_out, NULL, NULL, 0, 0);
+}
+
+/* ---- global init + parallel piece download (connection pool) ----------- */
+
+void patchdl_net_global_init(void)    { curl_global_init(CURL_GLOBAL_ALL); }
+void patchdl_net_global_cleanup(void) { curl_global_cleanup(); }
+
+/* Write sink for one piece: pwrite at a fixed base offset (concurrent
+   non-overlapping pieces of the same fd are safe), tee into SHA-256 if asked,
+   and publish bytes-so-far for live progress. */
+typedef struct {
+    int                 fd;
+    long long           base;
+    long long           written;
+    EVP_MD_CTX         *md;
+    volatile long long *bytes_slot;
+} piece_sink_t;
+
+static size_t
+piece_write_cb(void *ptr, size_t size, size_t nmemb, void *ud) {
+    piece_sink_t *s = (piece_sink_t *)ud;
+    size_t        n = size * nmemb;
+    ssize_t       w;
+    if (n == 0) return 0;
+    w = pwrite(s->fd, ptr, n, (off_t)(s->base + s->written));
+    if (w < 0 || (size_t)w != n) return 0;   /* short write -> curl errors out */
+    if (s->md) EVP_DigestUpdate(s->md, ptr, n);
+    s->written += (long long)n;
+    if (s->bytes_slot) *s->bytes_slot = s->written;
+    return n;
+}
+
+static int
+piece_xfer_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
+              curl_off_t ultotal, curl_off_t ulnow) {
+    volatile int *abort_flag = (volatile int *)clientp;
+    (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+    return (abort_flag && *abort_flag) ? 1 : 0;   /* non-zero aborts the transfer */
+}
+
+int
+patchdl_http_download_piece(const char *url, int fd,
+                            long long file_offset, long long file_size,
+                            const char *expected_sha256_or_null,
+                            patchdl_piece_ctx_t *ctx) {
+    CURL             *curl;
+    CURLcode          res;
+    long              http_code = 0;
+    char              host[256], ip[INET_ADDRSTRLEN], rs443[512], rs80[512];
+    struct curl_slist *rl = NULL;
+    struct curl_blob  ca_blob;
+    piece_sink_t      sink;
+    int               verify = (expected_sha256_or_null && expected_sha256_or_null[0]);
+
+    if (url_host(url, host, sizeof(host))) return -1;
+    if (!host_allowed(host)) return -1;
+    if (dns_lookup(host, ip, sizeof(ip))) return -1;
+
+    memset(&sink, 0, sizeof(sink));
+    sink.fd         = fd;
+    sink.base       = file_offset;
+    sink.bytes_slot = ctx ? ctx->bytes_slot : NULL;
+    if (verify) {
+        sink.md = EVP_MD_CTX_new();
+        if (sink.md) EVP_DigestInit_ex(sink.md, EVP_sha256(), NULL);
+    }
+
+    snprintf(rs443, sizeof(rs443), "%s:443:%s", host, ip);
+    rl = curl_slist_append(NULL, rs443);
+    snprintf(rs80, sizeof(rs80), "%s:80:%s", host, ip);
+    rl = curl_slist_append(rl, rs80);
+
+    ca_blob.data  = (void *)PATCHDL_SCEI_DNAS_ROOT_PEM;
+    ca_blob.len   = strlen(PATCHDL_SCEI_DNAS_ROOT_PEM);
+    ca_blob.flags = CURL_BLOB_COPY;
+
+    curl = curl_easy_init();
+    if (!curl) {
+        curl_slist_free_all(rl);
+        if (sink.md) EVP_MD_CTX_free(sink.md);
+        return -1;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL,             url);
+    curl_easy_setopt(curl, CURLOPT_RESOLVE,         rl);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,   piece_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA,       &sink);
+    curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB,     &ca_blob);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER,  1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST,  2L);
+    curl_easy_setopt(curl, CURLOPT_SSL_CIPHER_LIST, "DEFAULT@SECLEVEL=0");
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,  1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS,       5L);
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR,     1L);   /* 4xx/5xx -> error, no body written */
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,  20L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,  30L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT,       "patchdl/1.0");
+    if (ctx && ctx->abort) {
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS,       0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, piece_xfer_cb);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA,     (void *)ctx->abort);
+    }
+
+    res = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_cleanup(curl);
+    curl_slist_free_all(rl);
+
+    if (res != CURLE_OK) {
+        if (sink.md) EVP_MD_CTX_free(sink.md);
+        return -1;                          /* network error / abort */
+    }
+    if (file_size > 0 && sink.written != file_size) {
+        if (sink.md) EVP_MD_CTX_free(sink.md);
+        return -1;                          /* short or over-long -> failed */
+    }
+    if (sink.md) {
+        unsigned char dig[EVP_MAX_MD_SIZE];
+        unsigned int  dl = 0;
+        char          hex[2 * EVP_MAX_MD_SIZE + 1];
+        EVP_DigestFinal_ex(sink.md, dig, &dl);
+        EVP_MD_CTX_free(sink.md);
+        hex_encode(dig, dl, hex, sizeof(hex));
+        if (strcasecmp(hex, expected_sha256_or_null) != 0)
+            return -2;                      /* integrity mismatch */
+    }
+    fdatasync(fd);                          /* durable before the caller sets the done bit */
+    return 0;
+}
+
+void
+patchdl_manifest_free(patchdl_manifest_t *m) {
+    if (!m || !m->pieces) return;
+    for (int i = 0; i < m->count; i++) free(m->pieces[i].url);
+    free(m->pieces);
+    m->pieces = NULL;
+    m->count = 0;
+}
+
+int
+patchdl_fetch_manifest(const char *manifest_url, patchdl_manifest_t *out) {
+    patchdl_buf_t buf;
+    const char *pieces, *pieces_end, *p;
+    int       cap = 0, n = 0;
+    long long running = 0;
+
+    memset(out, 0, sizeof(*out));
+    if (patchdl_http_get(manifest_url, &buf)) return -1;
+    if (!buf.data || !buf.size) { free(buf.data); return -1; }
+
+    pieces = strstr(buf.data, "\"pieces\"");
+    if (!pieces || !(pieces = strchr(pieces, '['))) { free(buf.data); return -1; }
+    pieces_end = strchr(pieces, ']');
+
+    for (p = pieces; (p = strstr(p, "\"url\"")) && (!pieces_end || p < pieces_end); p += 5)
+        cap++;
+    if (cap <= 0) { free(buf.data); return -1; }
+    out->pieces = calloc((size_t)cap, sizeof(patchdl_piece_t));
+    if (!out->pieces) { free(buf.data); return -1; }
+
+    p = pieces;
+    while ((p = strstr(p, "\"url\"")) && (!pieces_end || p < pieces_end) && n < cap) {
+        char               url[768] = {0};
+        unsigned long long sz = 0, off = 0;
+        const char        *obj_end = strchr(p, '}');
+
+        if (json_string_after(p, "url", url, sizeof(url)))
+            break;
+        json_u64_after(p, "fileSize", &sz);
+        if (json_u64_after(p, "fileOffset", &off) != 0)
+            off = (unsigned long long)running;   /* no offset -> assume contiguous */
+
+        /* Validate tiling: pieces must be in order, contiguous, non-empty. */
+        if ((long long)off != running || sz == 0) {
+            patchdl_manifest_free(out);
+            free(buf.data);
+            return -1;
+        }
+        out->pieces[n].url    = strdup(url);
+        out->pieces[n].offset = (long long)off;
+        out->pieces[n].size   = (long long)sz;
+        json_string_after(p, "hashValue", out->pieces[n].hash,
+                          sizeof(out->pieces[n].hash));
+        if (!out->pieces[n].url) {
+            patchdl_manifest_free(out);
+            free(buf.data);
+            return -1;
+        }
+        running += (long long)sz;
+        n++;
+        out->count = n;          /* keep current so manifest_free frees exactly n */
+        p = obj_end ? obj_end + 1 : p + 5;
+    }
+    free(buf.data);
+    if (n == 0) { patchdl_manifest_free(out); return -1; }
+    out->total = running;        /* authoritative assembled size */
+    return 0;
 }
 
 void

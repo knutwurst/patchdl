@@ -26,6 +26,11 @@ static patchdl_title_t *g_titles;
 static size_t           g_title_count;
 static pthread_mutex_t  g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char            *g_debug_json; /* built once at startup */
+/* Background version.xml fetch thread. Joinable so shutdown can wait for it
+   before patchdl_scan_free frees g_titles out from under it. */
+static pthread_t        g_verxml_tid;
+static int              g_verxml_started;
+static volatile int     g_verxml_stop;
 static unsigned long    g_pkg_hits;
 static char             g_pkg_diag_json[768] = "{\"hits\":0}";
 
@@ -33,25 +38,77 @@ static char             g_pkg_diag_json[768] = "{\"hits\":0}";
    title structs (t->enabled) so it travels with the scan; the global fields
    live here. Both are saved to PATCHDL_CFG_PATH (homebrew data dir, never a
    system file) and reloaded on the next start. Guarded by g_mutex. */
+#define POOL_MAX_CONN 16
+#define POOL_MAX_JOBS 16
+
 static struct {
     char default_policy[8];        /* "deny" | "allow" */
     int  install_after_download;
     int  delete_pkg_after_install;
     int  verify_downloads;         /* SHA-256 each manifest piece (default off) */
     int  home_shortcut;            /* user wants a home-screen browser tile */
-} g_cfg = { "deny", 0, 1, 0, 1 };
+    int  max_connections;          /* parallel download connections (1..POOL_MAX_CONN) */
+} g_cfg = { "deny", 0, 1, 0, 1, 4 };
+
+/* ---------- download connection pool ----------------------------------- */
+/* N worker threads share one job at a time (admit_max=1): a single download
+   spreads its pieces across all N connections; extra titles queue. Resume uses
+   a per-piece done-bitmap in the sidecar so an out-of-order parallel download
+   survives a reboot. All pool state is guarded by g_pool.mtx (NOT g_mutex). */
+
+typedef enum { PC_PENDING = 0, PC_INFLIGHT, PC_DONE, PC_FAILED } pc_state_t;
+
+typedef struct {
+    pc_state_t state;
+    int        attempts;
+    int        slot;       /* worker slot while INFLIGHT, else -1 */
+} dl_pstate_t;
+
+typedef enum {
+    JOB_QUEUED = 0, JOB_ADMITTING, JOB_ACTIVE, JOB_PAUSING, JOB_CANCELLING,
+    JOB_PAUSED, JOB_DONE, JOB_FAILED
+} job_state_t;
+
+typedef struct dl_job {
+    char               title_id[32];
+    char               name[128];
+    char               version[16];
+    char               manifest_url[768];
+    char               dir[288];
+    char               dest[320];
+    int                is_manifest;
+    int                verify;
+    job_state_t        state;
+    unsigned int       seq;            /* bumped on cancel; stale completions discarded */
+    volatile int       abort;          /* read by the piece transfer callback */
+    long long          total;          /* assembled size (preallocated) */
+    long long          done_bytes;     /* sum of DONE piece sizes (committed) */
+    long long          speed_bps;
+    long long          sample_bytes;
+    double             sample_ts;
+    patchdl_manifest_t mf;             /* pieces (url/offset/size/hash) */
+    dl_pstate_t       *ps;             /* per-piece runtime state, mf.count entries */
+    unsigned char     *bitmap;         /* (count+7)/8; bit set == DONE + durable */
+    int                pieces_done;
+    int                pieces_failed;
+    int                inflight;
+    int                unpersisted;    /* DONE pieces since last sidecar flush */
+    int                fd;             /* O_RDWR dest fd, -1 until admit */
+    int                rc;             /* 0 ok, -1 net/io, -2 verify */
+    struct dl_job     *next;
+} dl_job_t;
 
 static struct {
-    int       active;
-    int       cancel;      /* set by a cancel request; worker aborts + deletes */
-    int       pause;       /* set by a pause request; worker aborts, keeps partial */
-    char      title_id[32];
-    char      name[128];
-    char      version[16];
-    char      path[320];
-    long long downloaded;
-    long long total;
-} g_dl;
+    pthread_mutex_t mtx;
+    pthread_cond_t  cv;                /* workers wait; broadcast on any change */
+    dl_job_t       *jobs;              /* linked list, queue order */
+    dl_job_t       *active;            /* the one admitted job, or NULL */
+    int             admitting;         /* a worker is fetching/preallocating next job */
+    int             stopping;
+    int             n_workers;
+    pthread_t       workers[POOL_MAX_CONN];
+    volatile long long inflight_bytes[POOL_MAX_CONN]; /* per-slot live counters */
+} g_pool = { .mtx = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
 
 #define PATCHDL_DL_DIR    "/data/patchdl"
 #define PATCHDL_CFG_PATH  "/data/patchdl/config.json"
@@ -87,6 +144,20 @@ json_get_bool(const char *s, const char *key, int dflt) {
     if (!strncmp(p, "true", 4))  return 1;
     if (!strncmp(p, "false", 5)) return 0;
     return dflt;
+}
+
+static int
+json_get_int(const char *s, const char *key, int dflt) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(s, pat);
+    if (!p) return dflt;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return dflt;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p < '0' || *p > '9') return dflt;
+    return (int)strtol(p, NULL, 10);
 }
 
 /* Find `"key":"value"` and copy value into out. */
@@ -433,7 +504,7 @@ build_status_json(void) {
    are appended from config_tail_json. Caller owns the result (queue_json_owned). */
 static char *
 build_config_json(void) {
-    char head[192];
+    char head[224];
 
     pthread_mutex_lock(&g_mutex);
     snprintf(head, sizeof(head),
@@ -441,12 +512,14 @@ build_config_json(void) {
              "\"install_after_download\":%s,"
              "\"delete_pkg_after_install\":%s,"
              "\"verify_downloads\":%s,"
-             "\"home_shortcut\":%s,",
+             "\"home_shortcut\":%s,"
+             "\"max_connections\":%d,",
              g_cfg.default_policy[0] ? g_cfg.default_policy : "deny",
              g_cfg.install_after_download ? "true" : "false",
              g_cfg.delete_pkg_after_install ? "true" : "false",
              g_cfg.verify_downloads ? "true" : "false",
-             g_cfg.home_shortcut ? "true" : "false");
+             g_cfg.home_shortcut ? "true" : "false",
+             g_cfg.max_connections);
     pthread_mutex_unlock(&g_mutex);
 
     char *out = malloc(strlen(head) + sizeof(config_tail_json));
@@ -472,12 +545,14 @@ save_config(void) {
             "\"install_after_download\":%s,\n"
             "\"delete_pkg_after_install\":%s,\n"
             "\"verify_downloads\":%s,\n"
-            "\"home_shortcut\":%s,\n\"titles\":{",
+            "\"home_shortcut\":%s,\n"
+            "\"max_connections\":%d,\n\"titles\":{",
             g_cfg.default_policy[0] ? g_cfg.default_policy : "deny",
             g_cfg.install_after_download ? "true" : "false",
             g_cfg.delete_pkg_after_install ? "true" : "false",
             g_cfg.verify_downloads ? "true" : "false",
-            g_cfg.home_shortcut ? "true" : "false");
+            g_cfg.home_shortcut ? "true" : "false",
+            g_cfg.max_connections);
     for (size_t i = 0; i < g_title_count; i++)
         fprintf(f, "%s\"%s\":%s", i ? "," : "",
                 g_titles[i].title_id, g_titles[i].enabled ? "true" : "false");
@@ -515,6 +590,10 @@ load_config(void) {
         json_get_bool(buf, "verify_downloads", g_cfg.verify_downloads);
     g_cfg.home_shortcut =
         json_get_bool(buf, "home_shortcut", g_cfg.home_shortcut);
+    g_cfg.max_connections =
+        json_get_int(buf, "max_connections", g_cfg.max_connections);
+    if (g_cfg.max_connections < 1) g_cfg.max_connections = 1;
+    if (g_cfg.max_connections > POOL_MAX_CONN) g_cfg.max_connections = POOL_MAX_CONN;
 
     /* per-title overrides live under "titles": { "<id>": true|false, ... } */
     const char *titles = strstr(buf, "\"titles\"");
@@ -605,42 +684,55 @@ build_titles_json(void) {
     return j.buf; /* caller owns; use queue_json_owned */
 }
 
+static const char *
+job_state_str(job_state_t s) {
+    switch (s) {
+    case JOB_QUEUED:     return "queued";
+    case JOB_ADMITTING:  return "active";
+    case JOB_ACTIVE:     return "active";
+    case JOB_PAUSING:    return "active";
+    case JOB_CANCELLING: return "active";
+    case JOB_PAUSED:     return "paused";
+    case JOB_DONE:       return "done";
+    default:             return "error";
+    }
+}
+
+/* List every download in the pool (queued/active/paused/done/error) with live
+   bytes = committed done_bytes + in-flight piece bytes. */
 static char *
 build_downloads_json(void) {
     jbuf_t j = {0};
-    long long downloaded, total;
-    int progress = 0;
-    char detail[128];
 
-    pthread_mutex_lock(&g_mutex);
+    pthread_mutex_lock(&g_pool.mtx);
     jbuf_append(&j, "[");
-    if (g_dl.active) {
-        downloaded = g_dl.downloaded;
-        total = g_dl.total;
-        if (total > 0 && downloaded >= 0)
-            progress = (int)((downloaded * 100) / total);
-        if (progress < 0) progress = 0;
-        if (progress > 100) progress = 100;
-        if (total > 0)
-            snprintf(detail, sizeof(detail), "%.1f GB of %.1f GB",
-                     downloaded / 1073741824.0, total / 1073741824.0);
-        else
-            snprintf(detail, sizeof(detail), "%.1f MB downloaded",
-                     downloaded / 1048576.0);
-
+    int first = 1;
+    for (dl_job_t *job = g_pool.jobs; job; job = job->next) {
+        long long bytes = job->done_bytes, total = job->total;
+        int progress;
+        if (job == g_pool.active)
+            for (int s = 0; s < g_pool.n_workers; s++)
+                bytes += g_pool.inflight_bytes[s];
+        if (total > 0) {
+            progress = (int)((bytes * 100) / total);
+            if (progress < 0) progress = 0;
+            if (progress > 100) progress = 100;
+        } else {
+            progress = (job->state == JOB_DONE) ? 100 : 0;
+        }
+        if (!first) jbuf_append(&j, ",");
+        first = 0;
         jbuf_append(&j, "{");
-        jbuf_append(&j, "\"title_id\":"); jbuf_append_str(&j, g_dl.title_id);
-        jbuf_append(&j, ",\"name\":");    jbuf_append_str(&j, g_dl.name);
-        jbuf_append(&j, ",\"version\":"); jbuf_append_str(&j, g_dl.version);
+        jbuf_append(&j, "\"title_id\":");  jbuf_append_str(&j, job->title_id);
+        jbuf_append(&j, ",\"name\":");      jbuf_append_str(&j, job->name);
+        jbuf_append(&j, ",\"version\":");   jbuf_append_str(&j, job->version);
+        jbuf_append(&j, ",\"state\":");     jbuf_append_str(&j, job_state_str(job->state));
         jbuf_appendf(&j, ",\"progress\":%d", progress);
-        jbuf_append(&j, ",\"detail\":");  jbuf_append_str(&j, detail);
-        jbuf_appendf(&j, ",\"bytes\":%lld,\"total_bytes\":%lld",
-                     downloaded, total);
-        jbuf_append(&j, ",\"path\":");    jbuf_append_str(&j, g_dl.path);
+        jbuf_appendf(&j, ",\"bytes\":%lld,\"total_bytes\":%lld", bytes, total);
         jbuf_append(&j, "}");
     }
     jbuf_append(&j, "]");
-    pthread_mutex_unlock(&g_mutex);
+    pthread_mutex_unlock(&g_pool.mtx);
     return j.buf;
 }
 
@@ -656,6 +748,15 @@ cleanup_installed_download(const char *title_id, const char *patch_url) {
     const char *base = strrchr(patch_url, '/');
     if (!path_segment_safe(title_id))
         return;
+    /* Never delete a directory the download pool still owns (a queued/active/
+       paused job for this title would have its fd/sidecar pulled out). */
+    pthread_mutex_lock(&g_pool.mtx);
+    for (dl_job_t *j = g_pool.jobs; j; j = j->next)
+        if (!strcmp(j->title_id, title_id)) {
+            pthread_mutex_unlock(&g_pool.mtx);
+            return;
+        }
+    pthread_mutex_unlock(&g_pool.mtx);
     base = base ? base + 1 : "patch.pkg";
     snprintf(dir, sizeof(dir), "/data/patchdl/%s", title_id);
     snprintf(path, sizeof(path), "%s/%s", dir, base);
@@ -672,6 +773,7 @@ verxml_fetch_thread(void *arg) {
         char              url[512] = {0};
         patchdl_verinfo_t info;
 
+        if (g_verxml_stop) break;   /* shutdown: stop before the next blocking query */
         memset(&info, 0, sizeof(info));
 
         /* The version.xml URL comes straight from the app.db (UUID included);
@@ -789,35 +891,28 @@ url_is_manifest(const char *url) {
     return n > 5 && !strcmp(url + n - 5, ".json");
 }
 
-/* Returns non-zero to abort the download when a cancel OR pause is requested. */
-static int
-download_progress_cb(void *ctx, long long downloaded, long long total) {
-    int abort_now;
-    (void)ctx;
-    pthread_mutex_lock(&g_mutex);
-    if (g_dl.active) {
-        g_dl.downloaded = downloaded;
-        g_dl.total = total;
-    }
-    abort_now = g_dl.cancel || g_dl.pause;
-    pthread_mutex_unlock(&g_mutex);
-    return abort_now;
+/* ---------- resume sidecar + pool helpers ------------------------------- */
+
+static void
+title_state_path(const char *title_id, char *out, size_t sz) {
+    snprintf(out, sz, "%s/%s/state.json", PATCHDL_DL_DIR, title_id);
 }
 
-/* Delete a title's internal download directory and its contents (a partial or
-   a finished package). Best-effort; only ever touches /data/patchdl. */
+static void
+remove_dl_state(const char *title_id) {
+    char path[320];
+    title_state_path(title_id, path, sizeof(path));
+    unlink(path);
+}
+
+/* Delete a title's internal download directory and its contents. Best-effort;
+   only ever touches /data/patchdl (self-protecting against a bad segment). */
 static void
 remove_title_dir(const char *title_id) {
     char           dir[288], path[560];
     DIR           *d;
     struct dirent *e;
-
-    /* Self-protecting: never build a delete path from an unsafe segment, even
-       if a future caller forgets the upstream check. A title_id of ".." would
-       otherwise resolve dir to /data and wipe it. */
-    if (!path_segment_safe(title_id))
-        return;
-
+    if (!path_segment_safe(title_id)) return;
     snprintf(dir, sizeof(dir), "%s/%s", PATCHDL_DL_DIR, title_id);
     if ((d = opendir(dir))) {
         while ((e = readdir(d))) {
@@ -831,103 +926,8 @@ remove_title_dir(const char *title_id) {
     rmdir(dir);
 }
 
-static void set_title_resumable(const char *title_id, int resumable, long long bytes);
-
-/* Cancel an in-progress download for this title (the worker aborts and removes
-   the partial), or delete an already-downloaded package if nothing is running. */
-static enum MHD_Result
-do_cancel(struct MHD_Connection *conn, const char *title_id) {
-    char resp[96];
-    int  was_active = 0;
-
-    pthread_mutex_lock(&g_mutex);
-    if (g_dl.active && !strcmp(g_dl.title_id, title_id)) {
-        g_dl.cancel = 1;
-        was_active = 1;
-    }
-    pthread_mutex_unlock(&g_mutex);
-
-    if (!was_active) {
-        remove_title_dir(title_id);
-        set_title_resumable(title_id, 0, 0);
-    }
-
-    snprintf(resp, sizeof(resp),
-             "{\"ok\":true,\"cancelled\":%s,\"deleted\":true}",
-             was_active ? "true" : "false");
-    return queue_json_owned(conn, MHD_HTTP_OK, strdup(resp));
-}
-
-/* Pause an in-progress download: the worker aborts but the partial is kept on
-   disk (and marked resumable), so it can be continued later. */
-static enum MHD_Result
-do_pause(struct MHD_Connection *conn, const char *title_id) {
-    int active = 0;
-    pthread_mutex_lock(&g_mutex);
-    if (g_dl.active && !strcmp(g_dl.title_id, title_id)) {
-        g_dl.pause = 1;
-        active = 1;
-    }
-    pthread_mutex_unlock(&g_mutex);
-    if (!active)
-        return queue_json(conn, MHD_HTTP_CONFLICT,
-                          "{\"ok\":false,\"reason\":\"not_downloading\"}");
-    return queue_json(conn, MHD_HTTP_OK, "{\"ok\":true,\"paused\":true}");
-}
-
-/* ---------- resume sidecar (/data/patchdl/<title>/state.json) ----------- */
-
-static long long
-file_size(const char *path) {
-    struct stat st;
-    if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) return (long long)st.st_size;
-    return -1;
-}
-
-static void
-title_state_path(const char *title_id, char *out, size_t sz) {
-    snprintf(out, sz, "%s/%s/state.json", PATCHDL_DL_DIR, title_id);
-}
-
-/* Record which manifest a partial download belongs to, so a resume only
-   continues a partial that matches the current patch. Sony CDN URLs contain no
-   characters that need JSON escaping, so the value is embedded verbatim. */
-static void
-write_dl_state(const char *title_id, const char *manifest_url) {
-    char  path[320];
-    FILE *f;
-    title_state_path(title_id, path, sizeof(path));
-    f = fopen(path, "w");
-    if (!f) return;
-    fprintf(f, "{\"manifest_url\":\"%s\"}\n", manifest_url);
-    fclose(f);
-}
-
-static int
-read_dl_state_url(const char *title_id, char *out, size_t sz) {
-    char   path[320], buf[1280];
-    FILE  *f;
-    size_t n;
-    out[0] = '\0';
-    title_state_path(title_id, path, sizeof(path));
-    f = fopen(path, "r");
-    if (!f) return -1;
-    n = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
-    buf[n] = '\0';
-    json_get_str(buf, "manifest_url", out, sz);
-    return out[0] ? 0 : -1;
-}
-
-static void
-remove_dl_state(const char *title_id) {
-    char path[320];
-    title_state_path(title_id, path, sizeof(path));
-    unlink(path);
-}
-
-/* Keep the resumable flag (set at startup) in sync after a download finishes or
-   its partial is deleted, so /api/titles stops reporting a stale partial. */
+/* Mirror the resumable flag into g_titles (read by /api/titles). Takes g_mutex,
+   so it must be called with the POOL lock NOT held (lock order: g_mutex first). */
 static void
 set_title_resumable(const char *title_id, int resumable, long long bytes) {
     pthread_mutex_lock(&g_mutex);
@@ -940,131 +940,587 @@ set_title_resumable(const char *title_id, int resumable, long long bytes) {
     pthread_mutex_unlock(&g_mutex);
 }
 
+static long long
+json_get_ll(const char *s, const char *key, long long dflt) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(s, pat);
+    if (!p) return dflt;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return dflt;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p < '0' || *p > '9') return dflt;
+    return strtoll(p, NULL, 10);
+}
+
+static void
+bitmap_to_hex(const unsigned char *bm, int nbytes, char *out, size_t sz) {
+    static const char hx[] = "0123456789abcdef";
+    int i = 0;
+    for (; i < nbytes && (size_t)(2 * i + 2) < sz; i++) {
+        out[2 * i]     = hx[(bm[i] >> 4) & 0xf];
+        out[2 * i + 1] = hx[bm[i] & 0xf];
+    }
+    out[2 * i] = '\0';
+}
+
+static void
+hex_to_bitmap(const char *hex, unsigned char *bm, int nbytes) {
+    for (int i = 0; i < nbytes; i++) {
+        char a = hex[2 * i], b = a ? hex[2 * i + 1] : 0;
+        int  hi, lo;
+        if (!a || !b) break;
+        hi = (a <= '9') ? a - '0' : (a | 32) - 'a' + 10;
+        lo = (b <= '9') ? b - '0' : (b | 32) - 'a' + 10;
+        bm[i] = (unsigned char)((hi << 4) | lo);
+    }
+}
+
+/* Write the job's resume sidecar atomically. Each set bit's bytes were already
+   fdatasync'd in patchdl_http_download_piece, so a set bit implies durable data.
+   Called with the pool lock held (the write is tiny). */
+static void
+write_job_state(const dl_job_t *job) {
+    char  path[320], tmp[340], *hex;
+    int   nbytes = (job->mf.count + 7) / 8;
+    FILE *f;
+    if (!job->bitmap) return;
+    title_state_path(job->title_id, path, sizeof(path));
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    hex = malloc((size_t)nbytes * 2 + 1);
+    if (!hex) return;
+    bitmap_to_hex(job->bitmap, nbytes, hex, (size_t)nbytes * 2 + 1);
+    f = fopen(tmp, "w");
+    if (f) {
+        fprintf(f,
+                "{\"manifest_url\":\"%s\",\"total\":%lld,\"piece_count\":%d,"
+                "\"done_bytes\":%lld,\"done\":\"%s\"}\n",
+                job->manifest_url, job->total, job->mf.count, job->done_bytes, hex);
+        fclose(f);
+        rename(tmp, path);
+    }
+    free(hex);
+}
+
+/* Seed a freshly-admitted job's piece states from its resume sidecar — only if
+   it belongs to THIS manifest (same url + size + piece count). Sets DONE bits,
+   ps[] states and done_bytes. Called with the pool lock held. */
+static void
+seed_from_sidecar(dl_job_t *job) {
+    char       path[320], buf[16384], murl[768];
+    FILE      *f;
+    size_t     n;
+    int        nbytes = (job->mf.count + 7) / 8;
+
+    title_state_path(job->title_id, path, sizeof(path));
+    f = fopen(path, "r");
+    if (!f) return;
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    json_get_str(buf, "manifest_url", murl, sizeof(murl));
+    if (strcmp(murl, job->manifest_url) ||
+        json_get_ll(buf, "total", -1) != job->total ||
+        json_get_int(buf, "piece_count", -1) != job->mf.count)
+        return;   /* stale / different patch -> start fresh */
+
+    {
+        size_t hexsz = (size_t)nbytes * 2 + 1;
+        char  *hex   = malloc(hexsz);
+        if (!hex) return;
+        json_get_str(buf, "done", hex, hexsz);
+        hex_to_bitmap(hex, job->bitmap, nbytes);
+        free(hex);
+    }
+    for (int i = 0; i < job->mf.count; i++)
+        if (job->bitmap[i / 8] & (1 << (i % 8))) {
+            job->ps[i].state = PC_DONE;
+            job->done_bytes += job->mf.pieces[i].size;
+        }
+}
+
+/* ---------- pool scheduler + workers ------------------------------------ */
+
+static int
+pick_pending_piece(const dl_job_t *job) {
+    /* pieces are stored in ascending offset order -> first PENDING is lowest */
+    for (int i = 0; i < job->mf.count; i++)
+        if (job->ps[i].state == PC_PENDING) return i;
+    return -1;
+}
+
+/* Unlink a job from the list and free it. Pool lock held. */
+static void
+free_job_locked(dl_job_t *job) {
+    dl_job_t **pp = &g_pool.jobs;
+    while (*pp && *pp != job) pp = &(*pp)->next;
+    if (*pp) *pp = job->next;
+    if (job->fd >= 0) close(job->fd);
+    patchdl_manifest_free(&job->mf);
+    free(job->ps);
+    free(job->bitmap);
+    free(job);
+}
+
+/* Cancel finalize: delete the file + sidecar and drop the job. Pool lock held
+   on entry/exit; dropped briefly for set_title_resumable (g_mutex). */
+static void
+finalize_cancel_locked(dl_job_t *job) {
+    char title_id[32], dir[288], dest[320];
+    snprintf(title_id, sizeof title_id, "%s", job->title_id);
+    snprintf(dir, sizeof dir, "%s", job->dir);
+    snprintf(dest, sizeof dest, "%s", job->dest);
+    if (g_pool.active == job) g_pool.active = NULL;
+    free_job_locked(job);                 /* closes fd, frees job */
+    unlink(dest);
+    remove_dl_state(title_id);
+    rmdir(dir);
+    pthread_mutex_unlock(&g_pool.mtx);
+    set_title_resumable(title_id, 0, 0);
+    pthread_mutex_lock(&g_pool.mtx);
+}
+
+/* Pause finalize: keep the partial, persist the bitmap, mark resumable. The job
+   stays in the list as JOB_PAUSED. Pool lock held on entry/exit. */
+static void
+finalize_pause_locked(dl_job_t *job) {
+    char      title_id[32];
+    long long done;
+    snprintf(title_id, sizeof title_id, "%s", job->title_id);
+    job->abort = 0;
+    write_job_state(job);
+    if (job->fd >= 0) { close(job->fd); job->fd = -1; }
+    job->state = JOB_PAUSED;
+    if (g_pool.active == job) g_pool.active = NULL;
+    done = job->done_bytes;
+    pthread_mutex_unlock(&g_pool.mtx);
+    set_title_resumable(title_id, done > 0, done);
+    pthread_mutex_lock(&g_pool.mtx);
+}
+
+/* Settle an active job whose pieces are all done or some failed. Pool lock held
+   on entry/exit. */
+static void
+settle_active_locked(dl_job_t *job) {
+    char title_id[32], dir[288], dest[320];
+    snprintf(title_id, sizeof title_id, "%s", job->title_id);
+    snprintf(dir, sizeof dir, "%s", job->dir);
+    snprintf(dest, sizeof dest, "%s", job->dest);
+    if (g_pool.active == job) g_pool.active = NULL;
+    if (job->fd >= 0) { close(job->fd); job->fd = -1; }
+
+    if (job->pieces_failed == 0 && job->pieces_done == job->mf.count) {
+        /* complete: keep the .pkg, drop the resume sidecar */
+        job->state = JOB_DONE;
+        remove_dl_state(title_id);
+        pthread_mutex_unlock(&g_pool.mtx);
+        set_title_resumable(title_id, 0, 0);
+        pthread_mutex_lock(&g_pool.mtx);
+    } else if (job->rc == -2) {
+        /* corrupt (failed SHA-256): delete, not resumable */
+        job->state = JOB_FAILED;
+        write_job_state(job);   /* harmless; overwritten by delete below */
+        unlink(dest);
+        remove_dl_state(title_id);
+        rmdir(dir);
+        pthread_mutex_unlock(&g_pool.mtx);
+        set_title_resumable(title_id, 0, 0);
+        pthread_mutex_lock(&g_pool.mtx);
+    } else {
+        /* network failure on a piece after retries: keep partial, resumable */
+        long long done = job->done_bytes;
+        job->state = JOB_FAILED;
+        write_job_state(job);
+        pthread_mutex_unlock(&g_pool.mtx);
+        set_title_resumable(title_id, done > 0, done);
+        pthread_mutex_lock(&g_pool.mtx);
+    }
+}
+
+/* Promote the head QUEUED job to ACTIVE: fetch+parse manifest, preallocate the
+   file, seed the resume bitmap. Network/disk I/O runs with the pool lock
+   DROPPED. Pool lock held on entry/exit. */
+static void
+admit_next(void) {
+    dl_job_t          *q = NULL;
+    patchdl_manifest_t mf;
+    char               murl[768], dest[320], dir[288];
+    int                is_manifest, fd = -1, ok = 0;
+    long long          total = 0, old_size = 0;
+    dl_pstate_t       *ps = NULL;
+    unsigned char     *bitmap = NULL;
+
+    for (dl_job_t *j = g_pool.jobs; j; j = j->next)
+        if (j->state == JOB_QUEUED) { q = j; break; }
+    if (!q) return;
+
+    g_pool.admitting = 1;
+    q->state = JOB_ADMITTING;       /* NOT claimable; a cancel/pause mid-admit only
+                                       flags it — admit_next is the sole finalizer.
+                                       g_pool.active stays NULL until fully built. */
+    is_manifest = q->is_manifest;
+    snprintf(murl, sizeof murl, "%s", q->manifest_url);
+    snprintf(dest, sizeof dest, "%s", q->dest);
+    snprintf(dir, sizeof dir, "%s", q->dir);
+    pthread_mutex_unlock(&g_pool.mtx);
+
+    /* ---- network + disk, NO pool lock ---- */
+    memset(&mf, 0, sizeof mf);
+    mkdir(PATCHDL_DL_DIR, 0777);
+    mkdir(dir, 0777);
+    if (is_manifest) {
+        if (patchdl_fetch_manifest(murl, &mf) == 0 && mf.count > 0) {
+            total = mf.total;
+            fd = open(dest, O_RDWR | O_CREAT, 0666);
+            if (fd >= 0) {
+                struct stat st;
+                if (fstat(fd, &st) == 0) old_size = (long long)st.st_size;
+                if (ftruncate(fd, (off_t)total) == 0) ok = 1;
+                else { close(fd); fd = -1; }
+            }
+        }
+    } else {
+        mf.pieces = calloc(1, sizeof(patchdl_piece_t));
+        if (mf.pieces) {
+            mf.pieces[0].url = strdup(murl);
+            mf.pieces[0].offset = 0;
+            mf.pieces[0].size = 0;         /* unknown -> size check skipped */
+            mf.count = 1; mf.total = 0; total = 0;
+            fd = open(dest, O_RDWR | O_CREAT | O_TRUNC, 0666);
+            if (fd >= 0 && mf.pieces[0].url) ok = 1;
+            else if (fd >= 0) { close(fd); fd = -1; }
+        }
+    }
+    if (ok) {
+        ps     = calloc((size_t)mf.count, sizeof(dl_pstate_t));
+        bitmap = calloc((size_t)((mf.count + 7) / 8), 1);
+        if (!ps || !bitmap) ok = 0;
+    }
+
+    pthread_mutex_lock(&g_pool.mtx);
+    g_pool.admitting = 0;
+    /* During the unlocked I/O window do_cancel/do_pause may have flagged q
+       (it stays JOB_ADMITTING otherwise). The job was never published as
+       g_pool.active, so no worker touched it and q is still valid here. */
+    if (!ok || q->state == JOB_CANCELLING) {
+        if (fd >= 0) close(fd);
+        patchdl_manifest_free(&mf);
+        free(ps);
+        free(bitmap);
+        if (q->state == JOB_CANCELLING) finalize_cancel_locked(q);
+        else { q->state = JOB_FAILED; q->rc = -1; }
+        pthread_cond_broadcast(&g_pool.cv);
+        return;
+    }
+    /* Resume of a previously paused job reuses the same dl_job_t, which still
+       carries the prior mf/ps/bitmap and a committed done_bytes. Free the stale
+       buffers and zero the committed counters before attaching the fresh ones so
+       the sidecar bitmap is the single source of truth (no leak, no double-count).
+       Harmless on a fresh job: mf is zeroed, ps/bitmap are NULL, free(NULL) is ok. */
+    patchdl_manifest_free(&q->mf);
+    free(q->ps);     q->ps     = NULL;
+    free(q->bitmap); q->bitmap = NULL;
+    q->done_bytes = 0; q->pieces_failed = 0; q->unpersisted = 0; q->rc = 0;
+
+    q->mf = mf; q->ps = ps; q->bitmap = bitmap; q->fd = fd; q->total = total;
+    for (int i = 0; i < mf.count; i++) q->ps[i].slot = -1;
+    seed_from_sidecar(q);
+    q->pieces_done = 0;
+    for (int i = 0; i < mf.count; i++)
+        if (q->ps[i].state == PC_DONE) q->pieces_done++;
+    /* One-time migration: an old sequential partial (written in order, no
+       per-piece bitmap) is a contiguous prefix on disk. If the bitmap seed found
+       nothing and the file is a partial (smaller than the full preallocated
+       size), mark every piece fully within the on-disk bytes as done so we don't
+       re-download what's already there. The partial frontier piece is excluded. */
+    if (q->pieces_done == 0 && old_size > 0 && old_size < total) {
+        for (int i = 0; i < mf.count; i++)
+            if (mf.pieces[i].offset + mf.pieces[i].size <= old_size) {
+                q->ps[i].state = PC_DONE;
+                q->bitmap[i / 8] |= (unsigned char)(1 << (i % 8));
+                q->done_bytes += mf.pieces[i].size;
+                q->pieces_done++;
+            }
+        if (q->pieces_done > 0) write_job_state(q);  /* persist the migrated bitmap */
+    }
+    /* A pause that landed during admit: persist the seeded/migrated bitmap and
+       park as PAUSED (keeping the on-disk partial) rather than starting the
+       transfer. finalize_pause_locked writes the sidecar and closes the fd. */
+    if (q->state == JOB_PAUSING) {
+        finalize_pause_locked(q);
+        pthread_cond_broadcast(&g_pool.cv);
+        return;
+    }
+    q->state = JOB_ACTIVE;
+    g_pool.active = q;
+    pthread_cond_broadcast(&g_pool.cv);
+}
+
+static void *
+dl_worker(void *arg) {
+    int slot = (int)(intptr_t)arg;
+
+    for (;;) {
+        dl_job_t *job;
+        int       pidx = -1;
+        char      url[768], hash[80];
+        long long off = 0, sz = 0;
+        unsigned int my_seq = 0;
+        int       fd = -1, verify = 0, rc;
+        volatile int *abort_ptr = NULL;
+
+        pthread_mutex_lock(&g_pool.mtx);
+        for (;;) {
+            if (g_pool.stopping) break;
+            job = g_pool.active;
+            if (!job) {
+                if (!g_pool.admitting) {
+                    int queued = 0;
+                    for (dl_job_t *j = g_pool.jobs; j; j = j->next)
+                        if (j->state == JOB_QUEUED) { queued = 1; break; }
+                    if (queued) { admit_next(); continue; }
+                }
+                pthread_cond_wait(&g_pool.cv, &g_pool.mtx);
+                continue;
+            }
+            if (job->state == JOB_ACTIVE) {
+                pidx = pick_pending_piece(job);
+                if (pidx >= 0) break;                 /* claim below */
+                if (job->inflight == 0) { settle_active_locked(job); pthread_cond_broadcast(&g_pool.cv); continue; }
+                pthread_cond_wait(&g_pool.cv, &g_pool.mtx);
+                continue;
+            }
+            if (job->state == JOB_PAUSING || job->state == JOB_CANCELLING) {
+                if (job->inflight == 0) {
+                    if (job->state == JOB_PAUSING) finalize_pause_locked(job);
+                    else                            finalize_cancel_locked(job);
+                    pthread_cond_broadcast(&g_pool.cv);
+                    continue;
+                }
+                pthread_cond_wait(&g_pool.cv, &g_pool.mtx);
+                continue;
+            }
+            pthread_cond_wait(&g_pool.cv, &g_pool.mtx);
+        }
+        if (g_pool.stopping) { pthread_mutex_unlock(&g_pool.mtx); break; }
+
+        /* claim piece pidx */
+        job->ps[pidx].state = PC_INFLIGHT;
+        job->ps[pidx].slot  = slot;
+        job->inflight++;
+        my_seq    = job->seq;
+        fd        = job->fd;
+        verify    = job->verify;
+        off       = job->mf.pieces[pidx].offset;
+        sz        = job->mf.pieces[pidx].size;
+        abort_ptr = &job->abort;
+        snprintf(url, sizeof url, "%s", job->mf.pieces[pidx].url);
+        snprintf(hash, sizeof hash, "%s", job->mf.pieces[pidx].hash);
+        g_pool.inflight_bytes[slot] = 0;
+        pthread_mutex_unlock(&g_pool.mtx);
+
+        /* ---- download the piece, NO lock ---- */
+        {
+            patchdl_piece_ctx_t ctx = { &g_pool.inflight_bytes[slot], abort_ptr };
+            rc = patchdl_http_download_piece(url, fd, off, sz,
+                                             verify && hash[0] ? hash : NULL, &ctx);
+        }
+
+        pthread_mutex_lock(&g_pool.mtx);
+        g_pool.inflight_bytes[slot] = 0;
+        job->inflight--;
+        job->ps[pidx].slot = -1;
+        if (my_seq != job->seq) {
+            /* job cancelled/torn down under us: discard result (do not touch
+               bitmap/counters); the finalizer runs once inflight hits 0 */
+        } else if (rc == 0) {
+            job->ps[pidx].state = PC_DONE;
+            job->pieces_done++;
+            job->done_bytes += sz;
+            job->bitmap[pidx / 8] |= (unsigned char)(1 << (pidx % 8));
+            if (++job->unpersisted >= 8) { write_job_state(job); job->unpersisted = 0; }
+        } else if (job->abort &&
+                   (job->state == JOB_PAUSING || job->state == JOB_CANCELLING)) {
+            job->ps[pidx].state = PC_PENDING;   /* aborted by pause -> redo on resume */
+        } else if (rc == -2) {
+            job->ps[pidx].state = PC_FAILED; job->pieces_failed++; job->rc = -2;
+        } else {
+            job->ps[pidx].attempts++;
+            if (job->ps[pidx].attempts < 4) job->ps[pidx].state = PC_PENDING;
+            else { job->ps[pidx].state = PC_FAILED; job->pieces_failed++; job->rc = -1; }
+        }
+        pthread_cond_broadcast(&g_pool.cv);
+        pthread_mutex_unlock(&g_pool.mtx);
+    }
+    return NULL;
+}
+
+/* ---------- HTTP handlers (enqueue/pause/cancel) ------------------------ */
+
+/* Enqueue a download. Returns 202 immediately; the pool admits + downloads it
+   across N connections. De-dupes by title_id; resumes a paused job. */
 static enum MHD_Result
 do_download(struct MHD_Connection *conn, const char *title_id,
             patchdl_source_t src, const char *patch_url,
             const char *name, const char *version, int enabled) {
-    char        dir[256], dest[320], resp[640];
-    long long   bytes = 0;
-    int         verify = 0, dlrc, is_manifest, resume = 0;
+    dl_job_t *job, *existing = NULL;
+    int       count = 0, verify;
 
     if (!enabled)
         return queue_json(conn, MHD_HTTP_FORBIDDEN,
                           "{\"ok\":false,\"reason\":\"title_disabled\"}");
-
     if (src == PATCHDL_SOURCE_UNKNOWN)
         return queue_json(conn, MHD_HTTP_FORBIDDEN,
                           "{\"ok\":false,\"reason\":\"source_unknown\"}");
-
     if (!patch_url[0])
         return queue_json(conn, MHD_HTTP_CONFLICT,
                           "{\"ok\":false,\"reason\":\"no_compatible_patch\"}");
 
-    /* /data/patchdl/<title_id>/<pkg-basename> — homebrew data dir, not system */
-    mkdir(PATCHDL_DL_DIR, 0777);
-    snprintf(dir, sizeof(dir), "%s/%s", PATCHDL_DL_DIR, title_id);
-    mkdir(dir, 0777);
-    title_pkg_path(title_id, patch_url, dest, sizeof(dest));
-
-    /* Resume: keep an existing partial only if it belongs to THIS manifest
-       (recorded in the sidecar); a partial from a different/older patch is
-       dropped. The partial survives a reboot because a killed process runs no
-       cleanup. Only manifest downloads resume. */
-    is_manifest = url_is_manifest(patch_url);
-    if (is_manifest && file_size(dest) > 0) {
-        char prev_url[1024] = {0};
-        if (read_dl_state_url(title_id, prev_url, sizeof(prev_url)) == 0 &&
-            !strcmp(prev_url, patch_url))
-            resume = 1;
-        else
-            unlink(dest);  /* stale partial from a different patch */
-    }
-    if (is_manifest)
-        write_dl_state(title_id, patch_url);
-
+    /* Snapshot the g_mutex-guarded flag before taking the pool lock (lock order
+       is g_mutex-before-g_pool, so we cannot read it while holding g_pool.mtx). */
     pthread_mutex_lock(&g_mutex);
-    if (g_dl.active) {
-        pthread_mutex_unlock(&g_mutex);
-        return queue_json(conn, MHD_HTTP_CONFLICT,
-                          "{\"ok\":false,\"reason\":\"download_in_progress\"}");
-    }
-    memset(&g_dl, 0, sizeof(g_dl));
-    g_dl.active = 1;
-    strncpy(g_dl.title_id, title_id, sizeof(g_dl.title_id) - 1);
-    strncpy(g_dl.name, name && name[0] ? name : title_id, sizeof(g_dl.name) - 1);
-    strncpy(g_dl.version, version ? version : "", sizeof(g_dl.version) - 1);
-    strncpy(g_dl.path, dest, sizeof(g_dl.path) - 1);
     verify = g_cfg.verify_downloads;
     pthread_mutex_unlock(&g_mutex);
 
-    dlrc = is_manifest
-        ? patchdl_http_download_manifest_progress(patch_url, dest, &bytes,
-                                                  download_progress_cb, NULL, verify, resume)
-        : patchdl_http_download_progress(patch_url, dest, &bytes,
-                                         download_progress_cb, NULL);
-    if (dlrc) {
-        int       was_cancel, was_pause;
-        long long have;
-        pthread_mutex_lock(&g_mutex);
-        was_cancel = g_dl.cancel;
-        was_pause  = g_dl.pause;
-        g_dl.active = 0;
-        g_dl.cancel = 0;
-        g_dl.pause  = 0;
-        pthread_mutex_unlock(&g_mutex);
-
-        if (was_cancel) {
-            /* user cancelled (stop): drop the partial + its resume sidecar */
-            unlink(dest);
-            remove_dl_state(title_id);
-            rmdir(dir);
-            set_title_resumable(title_id, 0, 0);
+    pthread_mutex_lock(&g_pool.mtx);
+    for (job = g_pool.jobs; job; job = job->next) {
+        count++;
+        if (!strcmp(job->title_id, title_id)) existing = job;
+    }
+    if (existing) {
+        job_state_t st = existing->state;
+        if (st == JOB_QUEUED || st == JOB_ADMITTING ||
+            st == JOB_ACTIVE || st == JOB_PAUSING) {
+            pthread_mutex_unlock(&g_pool.mtx);
             return queue_json(conn, MHD_HTTP_OK,
-                              "{\"ok\":false,\"cancelled\":true,"
-                              "\"reason\":\"download_cancelled\"}");
+                              "{\"ok\":true,\"queued\":true,\"already\":true}");
         }
-        if (was_pause) {
-            /* user paused: keep the partial + sidecar; it is now resumable. */
-            have = file_size(dest);
-            if (have < 0) have = 0;
-            set_title_resumable(title_id, have > 0, have);
-            snprintf(resp, sizeof(resp),
-                     "{\"ok\":false,\"paused\":true,\"reason\":\"download_paused\","
-                     "\"bytes\":%lld}", have);
-            return queue_json_owned(conn, MHD_HTTP_OK, strdup(resp));
+        if (st == JOB_CANCELLING) {        /* mid-cancel teardown — don't touch it */
+            pthread_mutex_unlock(&g_pool.mtx);
+            return queue_json(conn, MHD_HTTP_CONFLICT,
+                              "{\"ok\":false,\"reason\":\"cancelling\"}");
         }
-        if (dlrc == -2) {
-            /* corrupt data (failed SHA-256): don't keep it for resume */
-            unlink(dest);
-            remove_dl_state(title_id);
-            rmdir(dir);
-            set_title_resumable(title_id, 0, 0);
-        } else {
-            /* network failure: the partial + sidecar are kept, and the title is
-               now resumable (also survives a reboot). */
-            set_title_resumable(title_id, 1, file_size(dest));
+        if (st == JOB_PAUSED) {            /* resume */
+            existing->state = JOB_QUEUED;
+            pthread_cond_broadcast(&g_pool.cv);
+            pthread_mutex_unlock(&g_pool.mtx);
+            return queue_json(conn, MHD_HTTP_OK,
+                              "{\"ok\":true,\"queued\":true,\"resumed\":true}");
         }
-        snprintf(resp, sizeof(resp), "{\"ok\":false,\"reason\":\"%s\"}",
-                 dlrc == -2 ? "piece_verify_failed" : "download_failed");
-        return queue_json_owned(conn, MHD_HTTP_BAD_GATEWAY, strdup(resp));
+        if (st == JOB_DONE) {              /* already downloaded */
+            pthread_mutex_unlock(&g_pool.mtx);
+            return queue_json(conn, MHD_HTTP_OK,
+                              "{\"ok\":true,\"downloaded\":true,\"already\":true}");
+        }
+        /* FAILED: drop it and re-enqueue fresh below */
+        free_job_locked(existing);
+        count--;
+    }
+    if (count >= POOL_MAX_JOBS) {
+        pthread_mutex_unlock(&g_pool.mtx);
+        return queue_json(conn, MHD_HTTP_SERVICE_UNAVAILABLE,
+                          "{\"ok\":false,\"reason\":\"queue_full\"}");
     }
 
-    pthread_mutex_lock(&g_mutex);
-    g_dl.downloaded = bytes;
-    g_dl.total = bytes;
-    g_dl.active = 0;
-    pthread_mutex_unlock(&g_mutex);
+    job = calloc(1, sizeof(*job));
+    if (!job) {
+        pthread_mutex_unlock(&g_pool.mtx);
+        return queue_text(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "oom");
+    }
+    snprintf(job->title_id, sizeof job->title_id, "%s", title_id);
+    snprintf(job->name, sizeof job->name, "%s", name && name[0] ? name : title_id);
+    snprintf(job->version, sizeof job->version, "%s", version ? version : "");
+    snprintf(job->manifest_url, sizeof job->manifest_url, "%s", patch_url);
+    snprintf(job->dir, sizeof job->dir, "%s/%s", PATCHDL_DL_DIR, title_id);
+    title_pkg_path(title_id, patch_url, job->dest, sizeof job->dest);
+    job->is_manifest = url_is_manifest(patch_url);
+    job->verify = verify;
+    job->state = JOB_QUEUED;
+    job->fd = -1;
+    /* append to keep FIFO queue order */
+    {
+        dl_job_t **pp = &g_pool.jobs;
+        while (*pp) pp = &(*pp)->next;
+        *pp = job;
+    }
+    pthread_cond_broadcast(&g_pool.cv);
+    pthread_mutex_unlock(&g_pool.mtx);
 
-    remove_dl_state(title_id);            /* complete: drop sidecar, keep the pkg */
-    set_title_resumable(title_id, 0, 0);  /* no longer a partial */
+    return queue_json(conn, MHD_HTTP_ACCEPTED, "{\"ok\":true,\"queued\":true}");
+}
 
-    /* shadowmount: download allowed, install is not (per source policy). */
-    snprintf(resp, sizeof(resp),
-             "{\"ok\":true,\"downloaded\":true,\"bytes\":%lld,\"path\":\"%s\","
-             "\"install_allowed\":%s}",
-             bytes, dest,
-             src == PATCHDL_SOURCE_SHADOWMOUNT ? "false" : "true");
-    return queue_json_owned(conn, MHD_HTTP_OK, strdup(resp));
+/* Pause: keep the partial (resumable). The active job aborts; a queued job is
+   just parked. */
+static enum MHD_Result
+do_pause(struct MHD_Connection *conn, const char *title_id) {
+    dl_job_t *job;
+    int       acted = 0;
+
+    pthread_mutex_lock(&g_pool.mtx);
+    for (job = g_pool.jobs; job; job = job->next) {
+        if (strcmp(job->title_id, title_id)) continue;
+        if (job->state == JOB_ACTIVE || job->state == JOB_ADMITTING) {
+            /* ADMITTING: admit_next sees JOB_PAUSING on relock and parks it
+               PAUSED, keeping the partial — no transfer is started. */
+            job->state = JOB_PAUSING;
+            job->abort = 1;
+            pthread_cond_broadcast(&g_pool.cv);
+            acted = 1;
+        } else if (job->state == JOB_QUEUED) {
+            job->state = JOB_PAUSED;
+            acted = 1;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&g_pool.mtx);
+    if (!acted)
+        return queue_json(conn, MHD_HTTP_CONFLICT,
+                          "{\"ok\":false,\"reason\":\"not_downloading\"}");
+    return queue_json(conn, MHD_HTTP_OK, "{\"ok\":true,\"paused\":true}");
+}
+
+/* Cancel: stop AND delete. The active job's workers abort and a worker finalizes
+   the delete once in-flight pieces drain; an idle/queued/paused/done job is
+   deleted directly; a leftover on-disk partial (no job) is removed too. */
+static enum MHD_Result
+do_cancel(struct MHD_Connection *conn, const char *title_id) {
+    dl_job_t *job;
+    int       had_job = 0;
+
+    pthread_mutex_lock(&g_pool.mtx);
+    for (job = g_pool.jobs; job; job = job->next) {
+        if (strcmp(job->title_id, title_id)) continue;
+        had_job = 1;
+        if (job->state == JOB_ADMITTING) {
+            /* being admitted (lock dropped for manifest I/O): only flag it.
+               admit_next holds a raw pointer to this job and is the sole
+               finalizer once it relocks — freeing here would be a UAF. */
+            job->state = JOB_CANCELLING;
+            job->seq++;
+            job->abort = 1;
+            pthread_cond_broadcast(&g_pool.cv);
+        } else if (job->state == JOB_ACTIVE || job->state == JOB_PAUSING) {
+            job->state = JOB_CANCELLING;
+            job->seq++;            /* discard late piece completions */
+            job->abort = 1;
+            pthread_cond_broadcast(&g_pool.cv);
+            if (job->inflight == 0) finalize_cancel_locked(job);
+        } else {
+            /* QUEUED / PAUSED / DONE / FAILED: no in-flight pieces */
+            finalize_cancel_locked(job);
+        }
+        break;
+    }
+    pthread_mutex_unlock(&g_pool.mtx);
+
+    if (!had_job) {
+        /* a partial left on disk from a previous boot has no live job */
+        remove_title_dir(title_id);
+        set_title_resumable(title_id, 0, 0);
+    }
+    return queue_json(conn, MHD_HTTP_OK, "{\"ok\":true,\"cancelled\":true}");
 }
 
 static enum MHD_Result
@@ -1237,6 +1693,10 @@ handle_config_post(struct MHD_Connection *conn, const char *body) {
         json_get_bool(body, "verify_downloads", g_cfg.verify_downloads);
     g_cfg.home_shortcut =
         json_get_bool(body, "home_shortcut", g_cfg.home_shortcut);
+    g_cfg.max_connections =
+        json_get_int(body, "max_connections", g_cfg.max_connections);
+    if (g_cfg.max_connections < 1) g_cfg.max_connections = 1;
+    if (g_cfg.max_connections > POOL_MAX_CONN) g_cfg.max_connections = POOL_MAX_CONN;
     pthread_mutex_unlock(&g_mutex);
 
     save_config();
@@ -1339,32 +1799,30 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
     return queue_asset(conn, url);
 }
 
-/* A title is resumable when its download dir holds both a resume sidecar and a
-   partial .pkg. Records the partial size for the UI. Single-threaded startup. */
+/* A title is resumable when its resume sidecar reports committed bytes between
+   0 and total (the .pkg is preallocated to the full size, so its on-disk size is
+   not progress — done_bytes from the bitmap sidecar is). Single-threaded. */
 static void
 detect_resumable_partials(void) {
-    char           dir[288], state[320], pkg[576];
-    DIR           *d;
-    struct dirent *e;
+    char   state[320], buf[16384];
+    FILE  *f;
+    size_t n;
 
     for (size_t i = 0; i < g_title_count; i++) {
         patchdl_title_t *t = &g_titles[i];
+        long long total, done;
         title_state_path(t->title_id, state, sizeof(state));
-        if (file_size(state) < 0) continue;          /* no sidecar -> not resumable */
-        snprintf(dir, sizeof(dir), "%s/%s", PATCHDL_DL_DIR, t->title_id);
-        d = opendir(dir);
-        if (!d) continue;
-        while ((e = readdir(d))) {
-            size_t nl = strlen(e->d_name);
-            if (nl > 4 && !strcmp(e->d_name + nl - 4, ".pkg")) {
-                long long sz;
-                snprintf(pkg, sizeof(pkg), "%s/%s", dir, e->d_name);
-                sz = file_size(pkg);
-                if (sz > 0) { t->resumable = 1; t->partial_bytes = sz; }
-                break;
-            }
+        f = fopen(state, "r");
+        if (!f) continue;
+        n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = '\0';
+        total = json_get_ll(buf, "total", 0);
+        done  = json_get_ll(buf, "done_bytes", 0);
+        if (done > 0 && (total <= 0 || done < total)) {
+            t->resumable = 1;
+            t->partial_bytes = done;
         }
-        closedir(d);
     }
 }
 
@@ -1372,9 +1830,6 @@ detect_resumable_partials(void) {
 
 int
 patchdl_websrv_start(unsigned short port) {
-    pthread_t tid;
-    pthread_attr_t attr;
-
     if (web_daemon) return 0;
 
     /* Collect real FW version and installed titles synchronously.
@@ -1398,6 +1853,23 @@ patchdl_websrv_start(unsigned short port) {
        swap it performs is unsafe once MHD worker threads are running. */
     g_debug_json = patchdl_scan_debug_json();
 
+    /* curl's global/OpenSSL init MUST run once, single-threaded, before the
+       download workers race their first curl_easy_init. */
+    patchdl_net_global_init();
+
+    /* Spawn the N-connection download pool BEFORE the web server accepts work. */
+    g_pool.n_workers = g_cfg.max_connections;
+    if (g_pool.n_workers < 1) g_pool.n_workers = 1;
+    if (g_pool.n_workers > POOL_MAX_CONN) g_pool.n_workers = POOL_MAX_CONN;
+    g_pool.stopping = 0;
+    for (int s = 0; s < g_pool.n_workers; s++) {
+        if (pthread_create(&g_pool.workers[s], NULL, dl_worker,
+                           (void *)(intptr_t)s)) {
+            g_pool.n_workers = s;   /* only the threads that started exist */
+            break;
+        }
+    }
+
     web_daemon = MHD_start_daemon(
         MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_THREAD_PER_CONNECTION,
         port, NULL, NULL, &on_request, NULL,
@@ -1405,17 +1877,24 @@ patchdl_websrv_start(unsigned short port) {
         MHD_OPTION_END);
 
     if (!web_daemon) {
+        pthread_mutex_lock(&g_pool.mtx);
+        g_pool.stopping = 1;
+        pthread_cond_broadcast(&g_pool.cv);
+        pthread_mutex_unlock(&g_pool.mtx);
+        for (int s = 0; s < g_pool.n_workers; s++)
+            pthread_join(g_pool.workers[s], NULL);
+        patchdl_net_global_cleanup();
         patchdl_scan_free(g_titles, g_title_count);
         g_titles = NULL;
         g_title_count = 0;
         return -1;
     }
 
-    /* Start background verxml fetch — detached, runs until complete */
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_create(&tid, &attr, verxml_fetch_thread, NULL);
-    pthread_attr_destroy(&attr);
+    /* Start background verxml fetch — joinable so patchdl_websrv_stop can wait
+       for it before freeing g_titles (it reads g_titles across blocking queries). */
+    g_verxml_stop = 0;
+    if (pthread_create(&g_verxml_tid, NULL, verxml_fetch_thread, NULL) == 0)
+        g_verxml_started = 1;
 
     return 0;
 }
@@ -1426,6 +1905,24 @@ patchdl_websrv_stop(void) {
         MHD_stop_daemon(web_daemon);
         web_daemon = NULL;
     }
+    /* Stop and join the background version.xml thread before anything frees
+       g_titles — it dereferences g_titles across blocking network queries. */
+    if (g_verxml_started) {
+        g_verxml_stop = 1;
+        pthread_join(g_verxml_tid, NULL);
+        g_verxml_started = 0;
+    }
+    /* Stop the pool: signal, join every worker (each finishes its current piece
+       write then exits), THEN tear curl + the title list down. */
+    pthread_mutex_lock(&g_pool.mtx);
+    g_pool.stopping = 1;
+    pthread_cond_broadcast(&g_pool.cv);
+    pthread_mutex_unlock(&g_pool.mtx);
+    for (int s = 0; s < g_pool.n_workers; s++)
+        pthread_join(g_pool.workers[s], NULL);
+    g_pool.n_workers = 0;
+    patchdl_net_global_cleanup();
+
     pthread_mutex_lock(&g_mutex);
     patchdl_scan_free(g_titles, g_title_count);
     g_titles      = NULL;

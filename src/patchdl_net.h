@@ -11,7 +11,51 @@ typedef struct {
 patchdl_buf_t *patchdl_buf_new(void);
 void           patchdl_buf_free(patchdl_buf_t *b);
 
+/* Call once, single-threaded, before any concurrent download worker starts /
+   after they have all joined. curl's global/OpenSSL init is otherwise lazy and
+   races across threads. */
+void patchdl_net_global_init(void);
+void patchdl_net_global_cleanup(void);
+
 int patchdl_http_get(const char *url, patchdl_buf_t *out);
+
+/* ---- parallel piece download (used by the connection pool) ------------- */
+
+/* One piece of a split manifest package. `url` is heap-allocated. */
+typedef struct {
+    char     *url;
+    long long offset;     /* byte offset of this piece in the assembled file */
+    long long size;       /* exact length of this piece */
+    char      hash[80];   /* manifest SHA-256 hex, or "" */
+} patchdl_piece_t;
+
+typedef struct {
+    patchdl_piece_t *pieces;
+    int              count;
+    long long        total;   /* assembled file size = sum of piece sizes */
+} patchdl_manifest_t;
+
+/* Fetch + parse a Sony JSON manifest into a validated, contiguously-tiled
+   piece list. Returns 0 on success (caller frees with patchdl_manifest_free),
+   -1 on fetch/parse/tiling failure. */
+int  patchdl_fetch_manifest(const char *manifest_url, patchdl_manifest_t *out);
+void patchdl_manifest_free(patchdl_manifest_t *m);
+
+/* Live state shared with one in-flight piece download. The worker owns these;
+   the curl callbacks read `abort` (set elsewhere) and publish progress into
+   `bytes_slot` (single-writer per worker slot). */
+typedef struct {
+    volatile long long *bytes_slot;  /* bytes written so far for this piece */
+    volatile int       *abort;       /* non-zero -> stop this transfer */
+} patchdl_piece_ctx_t;
+
+/* Download one whole piece and pwrite it into `fd` at `file_offset`. Concurrent
+   non-overlapping pieces of the same fd are safe. Returns 0 on success (and
+   fdatasyncs fd), -1 on network/IO/abort, -2 on a SHA-256 mismatch. */
+int patchdl_http_download_piece(const char *url, int fd,
+                                long long file_offset, long long file_size,
+                                const char *expected_sha256_or_null,
+                                patchdl_piece_ctx_t *ctx);
 
 /* Progress callback. Return non-zero to ABORT the in-flight download (used to
    cancel large patch downloads); return 0 to continue. */

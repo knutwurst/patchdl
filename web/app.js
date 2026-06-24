@@ -29,6 +29,7 @@ const fallback = {
     delete_pkg_after_install: true,
     verify_downloads: false,
     home_shortcut: true,
+    max_connections: 4,
     source_policy: {
       official: { allow_check: true, allow_download: true, allow_install: true },
       external: { allow_check: true, allow_download: true, allow_install: true },
@@ -116,6 +117,7 @@ function bindElements() {
     deleteAfterInstall: document.getElementById("deleteAfterInstall"),
     verifyDownloads: document.getElementById("verifyDownloads"),
     homeShortcut: document.getElementById("homeShortcut"),
+    maxConnections: document.getElementById("maxConnections"),
     refreshBtn: document.getElementById("refreshBtn"),
     saveBtn: document.getElementById("saveBtn"),
     clearLogBtn: document.getElementById("clearLogBtn"),
@@ -173,27 +175,26 @@ async function loadInitialData() {
   // /api/titles carries no client-only progress flags, so preserve them across a
   // refresh — otherwise an in-flight download/install flips back to a clickable
   // button mid-operation.
+  // Carry client-only flags across a refresh; the pool's job list is the source
+  // of truth for download state and is reconciled right after.
   const prev = new Map(state.titles.map((g) => [g.title_id, g]));
   titles.forEach((g) => {
     const old = prev.get(g.title_id);
-    // Carry client-only progress flags across a refresh — unless the server now
-    // reports the title up to date (the patch applied), in which case drop them.
     if (old && g.status !== "up_to_date") {
-      if (old.downloading) g.downloading = true;
       if (old.downloaded) g.downloaded = true;
       if (old.installing) g.installing = true;
+      if (old._autoInstalled) g._autoInstalled = true;
       if (old._localDownloading) g._localDownloading = true;
     }
   });
-  // Reconcile active downloads the server reports, so progress + Cancel show even
-  // after a hard reload or a download started from another session/device.
-  const activeDl = new Set(downloads.map((d) => d.title_id));
-  titles.forEach((g) => { if (activeDl.has(g.title_id)) g.downloading = true; });
 
   state = { ...state, status, config, titles, downloads };
+  reconcileFromJobs(downloads);
 
   render();
-  if (state.downloads.length) startDownloadPolling();
+  if (downloads.some((j) => j.state === "active" || j.state === "queued") ||
+      state.titles.some((g) => g._localDownloading))
+    startDownloadPolling();
   showToast(state.usingFallback ? "Demo data loaded. API is not reachable yet." : "Data refreshed.");
 }
 
@@ -234,6 +235,7 @@ function renderSettings() {
   els.deleteAfterInstall.checked = Boolean(state.config.delete_pkg_after_install);
   if (els.verifyDownloads) els.verifyDownloads.checked = Boolean(state.config.verify_downloads);
   if (els.homeShortcut) els.homeShortcut.checked = state.config.home_shortcut !== false;
+  if (els.maxConnections) els.maxConnections.value = state.config.max_connections || 4;
   els.allowlistHosts.replaceChildren(...(state.config.cdn_allowlist || []).map((host) => {
     const chip = document.createElement("span");
     chip.className = "host-chip";
@@ -441,6 +443,7 @@ function progressMetaHtml(d) {
   const done = Number(d.bytes) || 0;
   const total = Number(d.total_bytes) || 0;
   const speed = Number(d._speed) || 0;
+  if (d.state === "queued") return `<span>Queued — waiting for a free slot</span>`;
   const parts = [];
   parts.push(`<span><b>${formatBytes(done)}</b>${total > 0 ? ` / ${formatBytes(total)}` : ""}</span>`);
   if (speed > 0) parts.push(`<span><b>${formatBytes(speed)}/s</b></span>`);
@@ -463,55 +466,99 @@ function stopDownloadPolling() {
   downloadPollTimer = null;
 }
 
+// Map the pool's job list onto per-title flags, and auto-install once a job
+// finishes if "install after download" is on.
+function reconcileFromJobs(jobs) {
+  const byId = new Map((jobs || []).map((j) => [j.title_id, j]));
+  state.titles.forEach((g) => {
+    const j = byId.get(g.title_id);
+    if (!j) {
+      // The pool never produced a job for our local intent: time it out so the
+      // card can't wedge in "Downloading" forever (server restart between POST
+      // and poll, or an unexpected response shape).
+      if (g._localDownloading && g._localSince &&
+          Date.now() - g._localSince > 12000) {
+        g._localDownloading = false;
+      }
+      if (g.downloading && !g._localDownloading) g.downloading = false;
+      return;
+    }
+    g._localDownloading = false; // the pool now tracks it
+    if (j.state === "active" || j.state === "queued") {
+      g.downloading = true;
+      g.resumable = false;
+      g._wasActive = true;
+    } else if (j.state === "paused") {
+      g.downloading = false;
+      g.resumable = true;
+      g.partial_bytes = Number(j.bytes) || g.partial_bytes || 0;
+      g._wasActive = false;
+    } else if (j.state === "done") {
+      g.downloading = false;
+      g.resumable = false;
+      g.downloaded = true;
+      g._wasActive = false;
+      if (state.config.install_after_download && !g.installing && !g._autoInstalled) {
+        g._autoInstalled = true;
+        doInstall(g);
+      }
+    } else if (j.state === "error") {
+      // The server keeps the partial + sidecar (resumable) on a post-retry
+      // network failure. Reflect that so primaryButton shows "Resume" and the
+      // red Cancel stays available to delete the kept partial.
+      const bytes = Number(j.bytes) || 0;
+      if (g._wasActive) {
+        showToast(`${g.name}: download failed${bytes > 0 ? " — partial kept, press Resume to continue" : "."}`);
+      }
+      g._wasActive = false;
+      g.downloading = false;
+      g.resumable = bytes > 0;
+      g.partial_bytes = bytes || g.partial_bytes || 0;
+    }
+  });
+}
+
 async function refreshDownloads() {
-  let downloads;
+  let jobs;
   try {
     const response = await fetch(API.downloads, { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    downloads = await response.json();
+    jobs = await response.json();
   } catch (error) {
     return; // keep last state on a transient failure
   }
 
   const now = Date.now();
-  const activeIds = new Set();
-  downloads.forEach((d) => {
-    activeIds.add(d.title_id);
-    const done = Number(d.bytes) || 0;
-    const prev = dlMeta[d.title_id];
+  const ids = new Set();
+  jobs.forEach((j) => {
+    ids.add(j.title_id);
+    const done = Number(j.bytes) || 0;
+    const prev = dlMeta[j.title_id];
     if (prev && now > prev.t) {
       if (done >= prev.bytes) {
         const inst = ((done - prev.bytes) * 1000) / (now - prev.t); // bytes/s
         prev.speed = prev.speed ? prev.speed * 0.5 + inst * 0.5 : inst; // smoothed
       } else {
-        prev.speed = 0; // counter went backwards -> re-baseline, no stale speed
+        prev.speed = 0; // counter went backwards -> re-baseline
       }
     }
-    const meta = prev || (dlMeta[d.title_id] = { speed: 0 });
+    const meta = prev || (dlMeta[j.title_id] = { speed: 0 });
     meta.bytes = done;
     meta.t = now;
-    d._speed = meta.speed || 0;
+    j._speed = meta.speed || 0;
   });
-  Object.keys(dlMeta).forEach((id) => { if (!activeIds.has(id)) delete dlMeta[id]; });
+  Object.keys(dlMeta).forEach((id) => { if (!ids.has(id)) delete dlMeta[id]; });
 
-  state.downloads = downloads;
-
-  // Reconcile downloading flags with the server. A structural change (a download
-  // appeared or finished) needs a full re-render to add/remove the progress block
-  // and morph the button; otherwise update the bar in place.
+  state.downloads = jobs;
   const before = downloadingIds();
-  state.titles.forEach((g) => {
-    if (activeIds.has(g.title_id)) g.downloading = true;
-    else if (g.downloading && !g._localDownloading) g.downloading = false;
-  });
+  reconcileFromJobs(jobs);
   if (downloadingIds() !== before) renderGames();
   else applyDownloadProgress();
 
-  if (!downloads.length && !state.titles.some((g) => g.downloading)) {
-    if (++emptyPolls >= 3) stopDownloadPolling();
-  } else {
-    emptyPolls = 0;
-  }
+  const busy = jobs.some((j) => j.state === "active" || j.state === "queued") ||
+               state.titles.some((g) => g._localDownloading);
+  if (!busy) { if (++emptyPolls >= 3) stopDownloadPolling(); }
+  else emptyPolls = 0;
 }
 
 function downloadingIds() {
@@ -522,6 +569,11 @@ function downloadingIds() {
 function applyDownloadProgress() {
   let needRender = false;
   state.downloads.forEach((d) => {
+    // Only titles currently downloading render a progress tile; paused/done/error
+    // jobs linger in the pool list but have no .progress bar — skip them so a
+    // missing tile for a non-downloading title doesn't force a full rebuild.
+    const g = state.titles.find((t) => t.title_id === d.title_id);
+    if (!g || !g.downloading) return;
     const card = els.gameGrid.querySelector(`[data-title-id="${d.title_id}"]`);
     const bar = card && card.querySelector(".card-progress .progress > i");
     const meta = card && card.querySelector(".card-progress .progress-meta");
@@ -563,6 +615,9 @@ async function saveConfig() {
     delete_pkg_after_install: els.deleteAfterInstall.checked,
     verify_downloads: els.verifyDownloads ? els.verifyDownloads.checked : Boolean(state.config.verify_downloads),
     home_shortcut: els.homeShortcut ? els.homeShortcut.checked : state.config.home_shortcut !== false,
+    max_connections: els.maxConnections
+      ? Math.max(1, Math.min(16, parseInt(els.maxConnections.value, 10) || 4))
+      : (state.config.max_connections || 4),
   };
   try {
     await postJson(API.config, config);
@@ -578,19 +633,31 @@ async function saveConfig() {
 
 /* ---------------- actions (data layer) ---------------- */
 
+// Enqueue a download. The pool returns immediately (202); progress, completion
+// and (if configured) auto-install are driven by reconcileFromJobs() on poll.
 async function doDownload(game) {
   game.downloading = true;
-  game._localDownloading = true; // this client owns it; don't let a poll clear it
+  game._localDownloading = true;   // until the pool reports a job for this title
+  game._localSince = Date.now();   // bounded in reconcileFromJobs if no job appears
+  game._autoInstalled = false;
   state.downloads = state.downloads.filter((i) => i.title_id !== game.title_id);
-  state.downloads.push({ title_id: game.title_id, name: game.name, version: game.compatible_version || "", progress: 0, bytes: 0, total_bytes: 0 });
-  state.logs.push(`[${timeNow()}] Download started: ${game.title_id} ${game.compatible_version}`);
+  state.downloads.push({ title_id: game.title_id, name: game.name,
+                         version: game.compatible_version || "",
+                         state: "queued", progress: 0, bytes: 0, total_bytes: 0 });
   renderGames();
-  renderLogs();
   startDownloadPolling();
 
-  let r;
   try {
-    r = await postJson(API.action(game.title_id, "download"), {});
+    const r = await postJson(API.action(game.title_id, "download"), {});
+    if (r && r.downloaded && r.already) {
+      game.downloading = false;
+      game._localDownloading = false;
+      game.downloaded = true;
+      renderGames();
+    } else {
+      state.logs.push(`[${timeNow()}] Download queued: ${game.title_id} ${game.compatible_version || ""}`);
+      renderLogs();
+    }
   } catch (error) {
     game.downloading = false;
     game._localDownloading = false;
@@ -598,40 +665,8 @@ async function doDownload(game) {
     const why = reasonText(error);
     state.logs.push(`[${timeNow()}] download ${game.title_id} blocked: ${why}`);
     showToast(`${game.name}: ${why}`);
-    renderGames(); renderLogs(); stopDownloadPolling();
-    return false;
+    renderGames(); renderLogs();
   }
-
-  game.downloading = false;
-  game._localDownloading = false;
-  state.downloads = state.downloads.filter((i) => i.title_id !== game.title_id);
-
-  // Cancel / pause / soft failure returns HTTP 200 with ok:false (not thrown).
-  if (!r || r.ok === false) {
-    game.downloaded = false;
-    if (r && r.paused) {
-      // Paused: keep the partial, mark resumable so the tile shows Resume.
-      game.resumable = true;
-      game.partial_bytes = r.bytes || game.partial_bytes || 0;
-      state.logs.push(`[${timeNow()}] Download paused: ${game.title_id} (${formatBytes(game.partial_bytes)})`);
-      showToast(`${game.name}: paused at ${formatBytes(game.partial_bytes)}.`);
-    } else {
-      const what = r && r.cancelled ? "cancelled" : "failed";
-      state.logs.push(`[${timeNow()}] Download ${what}: ${game.title_id}`);
-      showToast(`${game.name}: download ${what}.`);
-    }
-    renderGames(); renderLogs(); stopDownloadPolling();
-    return false;
-  }
-
-  game.downloaded = true;
-  game.resumable = false;
-  game.partial_bytes = 0;
-  const sz = r && r.bytes ? formatBytes(r.bytes) : "?";
-  state.logs.push(`[${timeNow()}] Downloaded ${game.title_id} ${game.compatible_version} (${sz}, internal)`);
-  showToast(`${game.name}: downloaded ${sz}.`);
-  renderGames(); renderLogs(); stopDownloadPolling();
-  return true;
 }
 
 async function doInstall(game) {
@@ -680,11 +715,12 @@ async function cancelDownload(titleId) {
 async function runTitleAction(titleId, action) {
   const game = state.titles.find((i) => i.title_id === titleId);
   if (!game) return;
-  if (action === "download") await doDownload(game);
+  // "update" and "download" both just enqueue; for "update" (install-after-
+  // download on) the reconciler auto-installs once the pool reports it done.
+  if (action === "download" || action === "update") await doDownload(game);
   else if (action === "install") await doInstall(game);
   else if (action === "pause") await doPause(game);
   else if (action === "cancel") await cancelDownload(titleId);
-  else if (action === "update") { if (await doDownload(game)) await doInstall(game); }
 }
 
 // Pause only sends the signal; the in-flight doDownload() request returns its
