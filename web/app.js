@@ -311,9 +311,12 @@ function renderGames() {
 
 // Mutually-exclusive bucket per game for the filter chips.
 function gameCategory(game) {
+  // In-flight work (queued, active, paused, installing) lives in its own
+  // bucket so Updatable shows only what the user could still trigger.
+  if (game.installing || game.downloading || game.resumable) return "updating";
   // checking is transient (version lookup still running); keep it visible under
   // Updatable rather than letting it fall out of every specific filter.
-  if (game.installing || game.downloading || game.status === "checking") return "updatable";
+  if (game.status === "checking") return "updatable";
   if (game.patch_title_match === false) return "blocked";
   if (game.status === "available" && isDownloadAllowed(game)) return "updatable";
   if (!sourcePolicy(game).allow_install && !sourcePolicy(game).allow_download) return "blocked";
