@@ -7,6 +7,7 @@
 
 #include <pthread.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -45,6 +46,34 @@ typedef struct {
     long unknown[810];
 } ai_playgo_info_t;
 
+typedef struct {
+    int32_t error_code;
+    int32_t version;
+    char    description[512];
+    char    type[9];
+} ai_install_error_t;
+
+typedef struct {
+    char               status[16];
+    char               src_type[8];
+    uint32_t           remain_time;
+    uint64_t           downloaded_size;
+    uint64_t           initial_chunk_size;
+    uint64_t           total_size;
+    uint32_t           promote_progress;
+    ai_install_error_t error_info;
+    int32_t            local_copy_percent;
+    bool               is_copy_only;
+} ai_install_status_t;
+
+#define STATIC_ASSERT(c, n) typedef char static_assert_##n[(c) ? 1 : -1]
+STATIC_ASSERT(sizeof(ai_pkg_info_t) == 0x38, pkg_info_size);
+STATIC_ASSERT(sizeof(ai_meta_info_t) == (6 * sizeof(void *)), meta_info_size);
+STATIC_ASSERT(sizeof(ai_playgo_info_t) == 0x2700, playgo_info_size);
+STATIC_ASSERT(offsetof(ai_meta_info_t, uri) == 0, meta_uri_offset);
+STATIC_ASSERT(offsetof(ai_meta_info_t, icon_url) == (5 * sizeof(void *)),
+              meta_icon_offset);
+
 /* Sysmodule IDs (from ps5-payload-dev/sdk crt/rtld_sprx.c). */
 #define SYSMOD_IPMI           0x8000001d
 #define SYSMOD_USERSERVICE    0x80000011
@@ -58,12 +87,14 @@ typedef int (*ai_install_by_pkg_fn)(ai_meta_info_t *meta, ai_pkg_info_t *info,
                                     ai_playgo_info_t *playgo);
 typedef int (*ai_title_from_pkg_fn)(const char *path, char *title_id, int *is_app);
 typedef int (*ai_content_from_pkg_fn)(const char *path, char *content_id, int *is_app);
+typedef int (*ai_get_status_fn)(const char *content_id, ai_install_status_t *status);
 
 static ai_init_fn             ai_initialize;
 static ai_install_pkg_fn      ai_install_pkg;
 static ai_install_by_pkg_fn   ai_install_by_package;
 static ai_title_from_pkg_fn   ai_title_from_pkg;
 static ai_content_from_pkg_fn ai_content_from_pkg;
+static ai_get_status_fn       ai_get_status;
 
 /* Resolve + initialize the AppInstUtil backend WITHOUT linking the sce libs
    (that makes the ELF unloadable by the elfldr) and WITHOUT raw
@@ -77,6 +108,10 @@ static volatile int    g_stage;
 static int             g_err;
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
 static char            g_probe_json[2048]; /* filled by the backend thread */
+static char            g_last_content_id[AI_CONTENTID_SIZE];
+static char            g_last_target_title_id[32];
+static char            g_last_method[32];
+static int             g_last_start_rc;
 
 static intptr_t
 dynsym(const char *module, const char *sym) {
@@ -112,6 +147,37 @@ local_ip(char *out, size_t n) {
     freeifaddrs(ifa);
 }
 
+static void
+copy_bounded(char *dst, size_t dst_sz, const char *src, size_t src_sz) {
+    size_t n;
+    if (!dst || !dst_sz) return;
+    dst[0] = '\0';
+    if (!src || !src_sz) return;
+    for (n = 0; n + 1 < dst_sz && n < src_sz && src[n]; n++)
+        dst[n] = src[n];
+    dst[n] = '\0';
+}
+
+static void
+remember_install(const char *target_title_id, const char *method,
+                 const ai_pkg_info_t *pkg, const char *fallback_content_id,
+                 int rc) {
+    char cid[AI_CONTENTID_SIZE] = {0};
+
+    if (pkg)
+        copy_bounded(cid, sizeof(cid), pkg->content_id, sizeof(pkg->content_id));
+    if (!cid[0] && fallback_content_id)
+        copy_bounded(cid, sizeof(cid), fallback_content_id, strlen(fallback_content_id));
+
+    pthread_mutex_lock(&g_mtx);
+    snprintf(g_last_content_id, sizeof(g_last_content_id), "%s", cid);
+    snprintf(g_last_target_title_id, sizeof(g_last_target_title_id), "%s",
+             target_title_id ? target_title_id : "");
+    snprintf(g_last_method, sizeof(g_last_method), "%s", method ? method : "");
+    g_last_start_rc = rc;
+    pthread_mutex_unlock(&g_mtx);
+}
+
 /* Resolve (dlsym, never call) a list of candidate patch-install symbols and
    record which exist. Runs inside the backend thread, where the AppInstUtil
    module is already loaded — the same proven-safe context as the normal symbol
@@ -126,6 +192,7 @@ fill_probe(void) {
         "sceAppInstUtilInstallByPackageEx",
         "sceAppInstUtilGetTitleIdFromPkg",
         "sceAppInstUtilGetContentIdFromPkg",
+        "sceAppInstUtilGetInstallStatus",
         "sceAppInstUtilAppExist",
         "sceAppInstUtilAppGetInstallStatus",
         "sceAppInstUtilAppInstallStatus",
@@ -209,6 +276,8 @@ backend_init_thread(void *arg) {
                                                          "sceAppInstUtilGetTitleIdFromPkg");
     ai_content_from_pkg   = (ai_content_from_pkg_fn)dynsym("libSceAppInstUtil.sprx",
                                                           "sceAppInstUtilGetContentIdFromPkg");
+    ai_get_status         = (ai_get_status_fn)dynsym("libSceAppInstUtil.sprx",
+                                                     "sceAppInstUtilGetInstallStatus");
 
     /* Read-only feasibility probe — module is loaded, safe context. */
     fill_probe();
@@ -339,6 +408,78 @@ patchdl_install_pkg_meta(const char *local_path, char *content_id, size_t cid_sz
 }
 
 int
+patchdl_install_status_json(char *out, size_t out_sz) {
+    char cid[AI_CONTENTID_SIZE];
+    char tid[32];
+    char method[32];
+    int  start_rc;
+    ai_install_status_t st;
+    char status[17], src_type[9];
+    int  rc;
+    int  progress = 0;
+    int  terminal = 0;
+
+    if (!out || !out_sz)
+        return -1;
+
+    backend_start();
+
+    pthread_mutex_lock(&g_mtx);
+    snprintf(cid, sizeof(cid), "%s", g_last_content_id);
+    snprintf(tid, sizeof(tid), "%s", g_last_target_title_id);
+    snprintf(method, sizeof(method), "%s", g_last_method);
+    start_rc = g_last_start_rc;
+    pthread_mutex_unlock(&g_mtx);
+
+    if (!cid[0]) {
+        snprintf(out, out_sz, "{\"active\":false}");
+        return -1;
+    }
+    if (g_stage != 5) {
+        snprintf(out, out_sz,
+                 "{\"active\":true,\"content_id\":\"%s\",\"target_title_id\":\"%s\","
+                 "\"method\":\"%s\",\"start_rc\":%d,\"status\":\"backend_not_ready\","
+                 "\"stage\":\"%s\"}",
+                 cid, tid, method, start_rc, stage_str(g_stage));
+        return -1;
+    }
+    if (!ai_get_status) {
+        snprintf(out, out_sz,
+                 "{\"active\":true,\"content_id\":\"%s\",\"target_title_id\":\"%s\","
+                 "\"method\":\"%s\",\"start_rc\":%d,\"status\":\"unavailable\","
+                 "\"message\":\"sceAppInstUtilGetInstallStatus not exported\"}",
+                 cid, tid, method, start_rc);
+        return -1;
+    }
+
+    memset(&st, 0, sizeof(st));
+    rc = ai_get_status(cid, &st);
+    copy_bounded(status, sizeof(status), st.status, sizeof(st.status));
+    copy_bounded(src_type, sizeof(src_type), st.src_type, sizeof(st.src_type));
+    if (st.total_size > 0)
+        progress = (int)((st.downloaded_size * 100) / st.total_size);
+    if (progress < 0) progress = 0;
+    if (progress > 100) progress = 100;
+    terminal = (!strcmp(status, "playable") ||
+                !strcmp(status, "error") ||
+                !strcmp(status, "none"));
+
+    snprintf(out, out_sz,
+             "{\"active\":true,\"terminal\":%s,\"content_id\":\"%s\","
+             "\"target_title_id\":\"%s\",\"method\":\"%s\",\"start_rc\":%d,"
+             "\"rc\":%d,\"status\":\"%s\",\"src_type\":\"%s\","
+             "\"progress\":%d,\"downloaded_size\":%llu,\"total_size\":%llu,"
+             "\"promote_progress\":%u,\"error_code\":%d}",
+             terminal ? "true" : "false", cid, tid, method, start_rc, rc,
+             status, src_type, progress,
+             (unsigned long long)st.downloaded_size,
+             (unsigned long long)st.total_size,
+             (unsigned)st.promote_progress,
+             (int)st.error_info.error_code);
+    return rc;
+}
+
+int
 patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
                           const char *storage_title_id,
                           const char *target_content_id,
@@ -397,10 +538,18 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
                  pkg_tid, expected_title_id);
         return -1;
     }
+    if (pkg_tid_mismatch) {
+        snprintf(msg, msg_sz,
+                 "unsupported shared-master package (pkg %.12s, target %.12s): "
+                 "standalone AppInstUtil cannot retarget signed patch metadata",
+                 pkg_tid, expected_title_id ? expected_title_id : "");
+        return -1;
+    }
 
-    /* Preferred path: InstallByPackage accepts target metadata. Use it first,
-       and use it exclusively when the downloaded bytes report a master/storage
-       title id that differs from the target regional title id. */
+    /* Preferred path: etaHEN's DPI uses InstallByPackage with an empty
+       MetaInfo.content_id and lets AppInstUtil bind to the signed package
+       metadata. Passing the installed game's content id is NOT a retarget
+       override for shared-master regional bytes; those are refused above. */
     {
         char             file_uri[1100];
         char             http_loop_uri[1200] = {0};
@@ -439,7 +588,7 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         uris[3]                 = http_lan_uri[0] ? http_lan_uri : NULL;
         meta.ex_uri             = "";
         meta.playgo_scenario_id = "";
-        meta.content_id         = target_content_id ? target_content_id : "";
+        meta.content_id         = "";
         meta.content_name       = "PatchDL";
         meta.icon_url           = "";
 
@@ -458,8 +607,11 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
                              l ? "," : "", labels[i], (unsigned)rc2);
                 }
                 if (rc2 == 0) {
-                    snprintf(msg, msg_sz, "install started (InstallByPackage%s)",
-                             pkg_tid_mismatch ? ", shared master bytes" : "");
+                    remember_install(expected_title_id, "InstallByPackage",
+                                     &pkg, target_content_id, rc2);
+                    snprintf(msg, msg_sz, "install started (InstallByPackage, content %.47s)",
+                             pkg.content_id[0] ? pkg.content_id :
+                             (target_content_id ? target_content_id : ""));
                     return 0;
                 }
             }
@@ -480,7 +632,11 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
         ai_pkg_info_t pkg = {0};
         int rc2 = ai_install_pkg(sdk_path, &pkg);
         if (rc2 == 0) {
-            snprintf(msg, msg_sz, "install started (AppInstallPkg)");
+            remember_install(expected_title_id, "AppInstallPkg",
+                             &pkg, target_content_id, rc2);
+            snprintf(msg, msg_sz, "install started (AppInstallPkg, content %.47s)",
+                     pkg.content_id[0] ? pkg.content_id :
+                     (target_content_id ? target_content_id : ""));
             return 0;
         }
         snprintf(msg, msg_sz,

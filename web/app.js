@@ -3,6 +3,7 @@ const API = {
   titles: "/api/titles",
   config: "/api/config",
   downloads: "/api/downloads",
+  installStatus: "/api/installstatus",
   action: (titleId, action) => `/api/titles/${encodeURIComponent(titleId)}/${action}`,
 };
 
@@ -49,6 +50,7 @@ const fallback = {
       installed_version: "01.032.000", compatible_version: "01.041.000",
       latest_version: "01.041.000", latest_required_fw: "11.60",
       source_type: "official", source_path: "/system_ex/app/PPSA01628_00",
+      patch_storage_match: true,
       mount_from: "/dev/ssd0.system_ex", enabled: true, status: "available",
     },
     {
@@ -57,6 +59,7 @@ const fallback = {
       installed_version: "01.004.000", compatible_version: "01.004.000",
       latest_version: "01.004.000", latest_required_fw: "10.01",
       source_type: "external", source_path: "/system_data/priv/appmeta/external/PPSA01284_00",
+      patch_storage_match: true,
       mount_from: "/mnt/ext0/user/app/PPSA01284_00", enabled: true, status: "up_to_date",
     },
     {
@@ -65,6 +68,7 @@ const fallback = {
       installed_version: "01.000.000", compatible_version: "01.006.000",
       latest_version: "01.009.000", latest_required_fw: "12.00",
       source_type: "shadowmount", source_path: "/system_ex/app/PPSA90001_00",
+      patch_storage_match: true,
       mount_from: "/mnt/usb0/itemzflow/Shadowmounted Test Title", enabled: true, status: "available",
     },
   ],
@@ -85,6 +89,7 @@ let state = {
 };
 
 let downloadPollTimer = null;
+let installPollTimer = null;
 let emptyPolls = 0;
 const dlMeta = {}; // per-title speed tracking: { bytes, t, speed }
 
@@ -201,6 +206,7 @@ async function loadInitialData() {
   if (downloads.some((j) => j.state === "active" || j.state === "queued") ||
       state.titles.some((g) => g._localDownloading))
     startDownloadPolling();
+  if (state.titles.some((g) => g.installing)) startInstallPolling();
   showToast(state.usingFallback ? "Demo data loaded. API is not reachable yet." : "Data refreshed.");
 }
 
@@ -307,8 +313,8 @@ function gameCategory(game) {
   // Updatable rather than letting it fall out of every specific filter.
   if (game.installing || game.downloading || game.status === "checking") return "updatable";
   if (game.patch_title_match === false) return "blocked";
-  if (!sourcePolicy(game).allow_install) return "blocked";
-  if (game.status === "available") return "updatable";
+  if (game.status === "available" && isDownloadAllowed(game)) return "updatable";
+  if (!sourcePolicy(game).allow_install && !sourcePolicy(game).allow_download) return "blocked";
   if (game.status === "incompatible_fw") return "needsfw";
   return "uptodate";
 }
@@ -356,6 +362,7 @@ function createGameCard(game) {
       ${game.downloading ? `<span class="pill live">Downloading</span>` : ""}
       ${game.resumable && !game.downloading ? `<span class="pill warn">Paused</span>` : ""}
       ${statusPill(game)}
+      ${storagePill(game)}
       ${sourcePill(game)}
     </div>
     <div class="versions">
@@ -391,6 +398,15 @@ function createGameCard(game) {
       <div class="progress-meta">${progressMetaHtml(d)}</div>
     `;
     card.appendChild(prog);
+  } else if (game.installing) {
+    const pct = Math.max(0, Math.min(100, Number(game.installProgress) || 0));
+    const note = document.createElement("div");
+    note.className = "card-progress";
+    note.innerHTML = `
+      <div class="progress"><i style="width:${pct}%"></i></div>
+      <div class="progress-meta">${installProgressHtml(game)}</div>
+    `;
+    card.appendChild(note);
   } else if (game.resumable && game.partial_bytes > 0) {
     // ---- paused partial (survived a reboot) ----
     const note = document.createElement("div");
@@ -433,13 +449,14 @@ function primaryButton(game) {
   if (game.installing) return { label: "Installing…", variant: "ghost", disabled: true };
   if (game.downloading) return { label: "Pause", action: "pause", variant: "pause", hint: "Pause the download (keeps what was downloaded)." };
   if (game.patch_title_match === false) return null;
-  if (!isInstallAllowed(game)) return null;
-  if (game.resumable)
+  if (game.resumable && isDownloadAllowed(game))
     return { label: "Resume", action: "download", variant: "update", hint: "Continue the paused download where it stopped." };
-  if (game.downloaded && game.status === "available")
+  if (game.downloaded && game.status === "available" && isInstallAllowed(game))
     return { label: "Install", action: "install", variant: "update", hint: "Install the downloaded patch (modifies the game)." };
+  if (game.downloaded && game.status === "available") return null;
   if (game.status !== "available") return null;
-  return state.config.install_after_download
+  if (!isDownloadAllowed(game)) return null;
+  return state.config.install_after_download && isInstallAllowed(game)
     ? { label: "Update", action: "update", variant: "update", hint: "Download and install the update." }
     : { label: "Download", action: "download", variant: "update", hint: "Download the patch internally." };
 }
@@ -461,6 +478,10 @@ function statusPill(game) {
   if (game.status === "incompatible_fw") return `<span class="pill warn">Needs FW ${escapeHtml(game.latest_required_fw || "")}</span>`;
   if (game.status === "up_to_date") return `<span class="pill">Up to date</span>`;
   return `<span class="pill">No patch info</span>`;
+}
+
+function storagePill(game) {
+  return hasSharedStorage(game) ? `<span class="pill warn">Shared master</span>` : "";
 }
 
 function sourcePill(game) {
@@ -490,6 +511,16 @@ function progressMetaHtml(d) {
   if (speed > 0 && total > done) parts.push(`<span>ETA <b>${formatEta((total - done) / speed)}</b></span>`);
   else if (!total) parts.push(`<span>Fetching manifest…</span>`);
   parts.push(`<span><b>${pctOf(d)}%</b></span>`);
+  return parts.join("");
+}
+
+function installProgressHtml(game) {
+  const status = game.installStatus || "waiting";
+  const done = Number(game.installDone) || 0;
+  const total = Number(game.installTotal) || 0;
+  const parts = [`<span>Status <b>${escapeHtml(status)}</b></span>`];
+  if (total > 0) parts.push(`<span><b>${formatBytes(done)}</b> / ${formatBytes(total)}</span>`);
+  parts.push(`<span><b>${Math.max(0, Math.min(100, Number(game.installProgress) || 0))}%</b></span>`);
   return parts.join("");
 }
 
@@ -538,7 +569,8 @@ function reconcileFromJobs(jobs) {
       g.resumable = false;
       g.downloaded = true;
       g._wasActive = false;
-      if (state.config.install_after_download && !g.installing && !g._autoInstalled) {
+      if (state.config.install_after_download && isInstallAllowed(g) &&
+          !g.installing && !g._autoInstalled) {
         g._autoInstalled = true;
         doInstall(g);
       }
@@ -556,6 +588,53 @@ function reconcileFromJobs(jobs) {
       g.partial_bytes = bytes || g.partial_bytes || 0;
     }
   });
+}
+
+function startInstallPolling() {
+  if (installPollTimer) return;
+  installPollTimer = setInterval(refreshInstallStatus, 2000);
+  refreshInstallStatus();
+}
+
+function stopInstallPolling() {
+  if (!installPollTimer) return;
+  clearInterval(installPollTimer);
+  installPollTimer = null;
+}
+
+async function refreshInstallStatus() {
+  let s;
+  try {
+    const response = await fetch(API.installStatus, { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    s = await response.json();
+  } catch (error) {
+    return;
+  }
+
+  if (!s || !s.active) {
+    if (!state.titles.some((g) => g.installing)) stopInstallPolling();
+    return;
+  }
+
+  const titleId = s.target_title_id || "";
+  const game = state.titles.find((g) => g.title_id === titleId || g.title_id.slice(0, 9) === titleId.slice(0, 9));
+  if (!game) return;
+
+  game.installing = !s.terminal;
+  game.installStatus = s.status || "running";
+  game.installProgress = Number(s.progress) || 0;
+  game.installDone = Number(s.downloaded_size) || 0;
+  game.installTotal = Number(s.total_size) || 0;
+  renderGames();
+
+  if (s.terminal) {
+    const ok = s.status === "playable";
+    state.logs.push(`[${timeNow()}] Install ${ok ? "completed" : "stopped"} for ${game.title_id}: ${s.status || "unknown"}${s.error_code ? ` (0x${Number(s.error_code >>> 0).toString(16)})` : ""}`);
+    renderLogs();
+    stopInstallPolling();
+    if (ok) loadInitialData();
+  }
 }
 
 async function refreshDownloads() {
@@ -709,6 +788,8 @@ async function doDownload(game) {
 
 async function doInstall(game) {
   game.installing = true;
+  game.installStatus = "starting";
+  game.installProgress = 0;
   game.downloaded = false; // the package is being consumed by the install
   renderGames();
   try {
@@ -722,7 +803,8 @@ async function doInstall(game) {
     return false;
   }
   state.logs.push(`[${timeNow()}] Install started for ${game.title_id} ${game.compatible_version} — running in PS5 background`);
-  showToast(`${game.name}: installing update — progress shows in your PS5 notifications.`);
+  showToast(`${game.name}: installing update.`);
+  startInstallPolling();
   renderGames(); renderLogs();
   return true;
 }
@@ -787,11 +869,26 @@ function updateGame(titleId, patch) {
 /* ---------------- policy helpers ---------------- */
 
 function isInstallBlocked(game) { return !sourcePolicy(game).allow_install; }
+function hasSharedStorage(game) {
+  if (game.patch_storage_match === false) return true;
+  const storage = (game.patch_storage_title_id || "").slice(0, 9);
+  const target = (game.title_id || "").slice(0, 9);
+  return Boolean(storage && target && storage !== target);
+}
+function isDownloadAllowed(game) {
+  return Boolean(
+    game.enabled !== false &&
+    game.compatible_version &&
+    game.patch_title_match !== false &&
+    sourcePolicy(game).allow_download
+  );
+}
 function isInstallAllowed(game) {
   return Boolean(
     game.enabled !== false &&
     game.compatible_version &&
     game.patch_title_match !== false &&
+    !hasSharedStorage(game) &&
     sourcePolicy(game).allow_install
   );
 }
@@ -820,6 +917,7 @@ async function postJson(url, body) {
 
 const REASON_TEXT = {
   patch_title_mismatch: "Patch metadata targets a different title - install blocked.",
+  cross_region_storage_unsupported: "Patch bytes are signed for a shared master title; this standalone installer cannot retarget them.",
   install_not_allowed_for_source: "Install blocked for this source.",
   source_unknown: "Source unknown — blocked.",
   no_compatible_patch: "No compatible patch available.",

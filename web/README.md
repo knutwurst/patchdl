@@ -16,6 +16,9 @@ GET  /api/config
 POST /api/config
 GET  /api/titles
 GET  /api/downloads
+GET  /api/installstatus
+GET  /api/pkgmeta/:title_id
+GET  /api/pkgverify/:title_id
 POST /api/titles/:title_id/check
 POST /api/titles/:title_id/download
 POST /api/titles/:title_id/install
@@ -88,3 +91,8 @@ For PS5 game updates, the backend may turn a Sony `manifest_url` into a merged
 local `.pkg` by downloading all manifest pieces. The `delta_url` `*-DP.pkg` is
 not shown as a separate user action because it can bootstrap the storage/master
 title instead of the installed regional target.
+
+If `patch_storage_match` is false, the UI keeps download/verify available but
+does not offer install or auto-install. Those shared-master packages are signed
+for a different storage title id and cannot be retargeted by standalone
+AppInstUtil on firmware 11.60.

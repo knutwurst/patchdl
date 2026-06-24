@@ -110,14 +110,18 @@ Dead Island 2 update (61.6 GB) downloaded and verified byte-perfect across
 several reboots.
 
 Install works for same-region patches, where Sony stores the patch bytes under
-the installed game's own title id.
+the installed game's own title id. PatchDL now mirrors etaHEN's native
+DirectPKGInstaller call shape for that path: it passes an empty
+`MetaInfo.content_id`, lets AppInstUtil bind the signed package metadata, keeps
+the returned content id, and exposes `/api/installstatus` for installer progress
+when `sceAppInstUtilGetInstallStatus` is exported.
 
 Cross-region patches are a known limitation. Sony sometimes packages a regional
 patch under a different (master) storage title and ships it as a debug-magic
 container. PatchDL downloads such a patch and verifies it against Sony's hashes,
-but the on-console installer (`InstallByPackage`) rejects it on 11.60, and the
-homebrew alternative (BGFT register) returns "not supported" outside the system
-process. Installing that class of patch needs Sony's authenticated updater, which
-nanoDNS blocks. The web UI marks a title "Installing…" and reads progress from the
-PS5's own notifications. Disc games need the disc inserted for their patch to
-apply, which is a normal Sony requirement.
+but refuses to install it from the standalone ELF because `InstallByPackage`
+does not retarget signed package metadata on 11.60, and the homebrew alternative
+(BGFT register) returns "not supported" outside the system process. Installing
+that class of patch needs Sony's authenticated updater, which nanoDNS blocks.
+Disc games need the disc inserted for their patch to apply, which is a normal
+Sony requirement.

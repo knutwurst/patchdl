@@ -14,9 +14,10 @@
  */
 /* `expected_title_id` is the title id of the installed game the patch is for.
    `storage_title_id` is the title id embedded in the delta_url storage path.
-   `target_content_id` is the installed game's content id from app.db; when
-   present it is passed to InstallByPackage so Sony's installer has the target
-   metadata even for region-shared/master-storage patch bytes. */
+   `target_content_id` is the installed game's content id from app.db; it is
+   retained for diagnostics and status fallback. Normal same-title installs
+   deliberately pass an empty MetaInfo.content_id, matching etaHEN's native DPI
+   path and letting AppInstUtil bind the package to its signed metadata. */
 int patchdl_install_local_pkg(const char *local_path,
                               const char *expected_title_id,
                               const char *storage_title_id,
@@ -37,3 +38,7 @@ int patchdl_install_api_probe(char *out, size_t out_sz);
 int patchdl_install_pkg_meta(const char *local_path, char *content_id, size_t cid_sz,
                              char *title_id, size_t tid_sz, int *is_app,
                              char *msg, size_t msg_sz);
+
+/* Read-only: report the last AppInstUtil install task PatchDL started, using
+   sceAppInstUtilGetInstallStatus when present. No install, no mutation. */
+int patchdl_install_status_json(char *out, size_t out_sz);

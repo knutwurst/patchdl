@@ -664,6 +664,9 @@ build_titles_json(void) {
             jbuf_append_ver_or_null(&j, t->patch_title_id);
         jbuf_append(&j, ",\"patch_storage_title_id\":");
             jbuf_append_ver_or_null(&j, t->patch_storage_title_id);
+        jbuf_appendf(&j, ",\"patch_storage_match\":%s",
+                     (!t->patch_storage_title_id[0] ||
+                      !strncmp(t->patch_storage_title_id, t->title_id, 9)) ? "true" : "false");
         /* This is the target title id parsed from version.xml/manifest_url.
            CDN storage paths may use another regional/master title id; that is
            not exposed here and must not block a valid target match. */
@@ -1569,6 +1572,16 @@ do_install(struct MHD_Connection *conn, const char *title_id,
                  patch_title_id, title_id);
         return queue_json_owned(conn, MHD_HTTP_CONFLICT, strdup(resp));
     }
+    if (patch_storage_title_id[0] &&
+        strncmp(patch_storage_title_id, title_id, 9) != 0) {
+        snprintf(resp, sizeof(resp),
+                 "{\"ok\":false,\"reason\":\"cross_region_storage_unsupported\","
+                 "\"patch_storage_title_id\":\"%.15s\",\"title_id\":\"%.15s\","
+                 "\"message\":\"Patch bytes are signed for a shared master title; "
+                 "standalone AppInstUtil cannot retarget them on 11.60\"}",
+                 patch_storage_title_id, title_id);
+        return queue_json_owned(conn, MHD_HTTP_CONFLICT, strdup(resp));
+    }
 
     title_pkg_path(title_id, patch_url, dest, sizeof(dest));
 
@@ -1804,6 +1817,12 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         return queue_json_owned(conn, MHD_HTTP_OK, strdup(p));
     }
 
+    if (!strcmp(url, "/api/installstatus")) {
+        char p[1024];
+        patchdl_install_status_json(p, sizeof(p));
+        return queue_json_owned(conn, MHD_HTTP_OK, strdup(p));
+    }
+
     if (!strcmp(url, "/api/pkgdiag"))
         return queue_json(conn, MHD_HTTP_OK, g_pkg_diag_json);
 
@@ -1908,9 +1927,14 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         snprintf(resp, sizeof resp,
                  "{\"ok\":%s,\"pkg_content_id\":\"%s\",\"pkg_title_id\":\"%s\","
                  "\"is_app\":%s,\"target_content_id\":\"%s\",\"target_title_id\":\"%s\","
-                 "\"storage_title_id\":\"%s\",\"msg\":\"%s\"}",
+                 "\"storage_title_id\":\"%s\",\"installable\":%s,\"install_plan\":\"%s\","
+                 "\"msg\":\"%s\"}",
                  rc == 0 ? "true" : "false", ecid, etid, is_app ? "true" : "false",
-                 cid, tid, psti, msg);
+                 cid, tid, psti,
+                 (psti[0] && strncmp(psti, tid, 9) != 0) ? "false" : "true",
+                 (psti[0] && strncmp(psti, tid, 9) != 0) ?
+                    "cross_region_storage_unsupported" : "installbypackage",
+                 msg);
         return queue_json_owned(conn, MHD_HTTP_OK, strdup(resp));
     }
 
