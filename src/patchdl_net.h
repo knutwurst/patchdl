@@ -57,6 +57,11 @@ int patchdl_http_download_piece(const char *url, int fd,
                                 const char *expected_sha256_or_null,
                                 patchdl_piece_ctx_t *ctx);
 
+/* Read-only: SHA-256 a [offset, offset+size) region of fd into out_hex
+   (caller provides >= 65 bytes). Returns 0 on success. */
+int patchdl_sha256_fd_region(int fd, long long offset, long long size,
+                             char *out_hex);
+
 /* Progress callback. Return non-zero to ABORT the in-flight download (used to
    cancel large patch downloads); return 0 to continue. */
 typedef int (*patchdl_download_progress_cb)(void *ctx,

@@ -1807,6 +1807,113 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
     if (!strcmp(url, "/api/pkgdiag"))
         return queue_json(conn, MHD_HTTP_OK, g_pkg_diag_json);
 
+    /* Read-only diagnostic: re-fetch the patch manifest for a title (PatchDL can
+       bypass the DNS block) and dump each piece's offset/size/SHA-256 so the
+       assembled .pkg can be verified against Sony's own hashes. No install. */
+    if (!strncmp(url, "/api/manifest/", 14)) {
+        const char      *tid = url + 14;
+        char             purl[768] = {0}, pti[32], psti[32], cid[64], nm[128], ver[16];
+        patchdl_source_t src;
+        int              en;
+        patchdl_manifest_t mf;
+        jbuf_t           j = {0};
+
+        if (!get_title_action_info(tid, &src, purl, sizeof purl, pti, sizeof pti,
+                                   psti, sizeof psti, cid, sizeof cid,
+                                   nm, sizeof nm, ver, sizeof ver, &en) || !purl[0])
+            return queue_json(conn, MHD_HTTP_NOT_FOUND,
+                              "{\"error\":\"no patch_url for title\"}");
+        memset(&mf, 0, sizeof mf);
+        if (patchdl_fetch_manifest(purl, &mf) != 0)
+            return queue_json(conn, MHD_HTTP_BAD_GATEWAY,
+                              "{\"error\":\"manifest fetch failed\"}");
+        jbuf_appendf(&j, "{\"count\":%d,\"total\":%lld,\"pieces\":[",
+                     mf.count, mf.total);
+        for (int i = 0; i < mf.count; i++) {
+            if (i) jbuf_append(&j, ",");
+            jbuf_appendf(&j, "{\"o\":%lld,\"s\":%lld,\"h\":\"%s\"}",
+                         mf.pieces[i].offset, mf.pieces[i].size, mf.pieces[i].hash);
+        }
+        jbuf_append(&j, "]}");
+        patchdl_manifest_free(&mf);
+        return queue_json_owned(conn, MHD_HTTP_OK,
+                                j.buf ? j.buf : strdup("{}"));
+    }
+
+    /* Read-only: SHA-256 every piece of the on-disk .pkg and compare to Sony's
+       manifest hashes — proves whether the assembled file is byte-correct. No
+       install. Hashing runs on-device (SSD), so no multi-GB transfer. */
+    if (!strncmp(url, "/api/pkgverify/", 15)) {
+        const char        *tid = url + 15;
+        char               purl[768] = {0}, pti[32], psti[32], cid[64], nm[128], ver[16];
+        char               dest[320];
+        patchdl_source_t   src;
+        int                en, fd, okc = 0, badc = 0, first_bad = -1;
+        patchdl_manifest_t mf;
+        jbuf_t             j = {0};
+
+        if (!get_title_action_info(tid, &src, purl, sizeof purl, pti, sizeof pti,
+                                   psti, sizeof psti, cid, sizeof cid,
+                                   nm, sizeof nm, ver, sizeof ver, &en) || !purl[0])
+            return queue_json(conn, MHD_HTTP_NOT_FOUND,
+                              "{\"error\":\"no patch_url for title\"}");
+        title_pkg_path(tid, purl, dest, sizeof dest);
+        fd = open(dest, O_RDONLY);
+        if (fd < 0)
+            return queue_json(conn, MHD_HTTP_NOT_FOUND,
+                              "{\"error\":\"pkg not on disk\"}");
+        memset(&mf, 0, sizeof mf);
+        if (patchdl_fetch_manifest(purl, &mf) != 0) {
+            close(fd);
+            return queue_json(conn, MHD_HTTP_BAD_GATEWAY,
+                              "{\"error\":\"manifest fetch failed\"}");
+        }
+        jbuf_appendf(&j, "{\"count\":%d,\"pieces\":[", mf.count);
+        for (int i = 0; i < mf.count; i++) {
+            char got[80] = {0};
+            int  ok = 0;
+            if (mf.pieces[i].hash[0] &&
+                patchdl_sha256_fd_region(fd, mf.pieces[i].offset,
+                                         mf.pieces[i].size, got) == 0)
+                ok = (strcasecmp(got, mf.pieces[i].hash) == 0);
+            if (ok) okc++; else { badc++; if (first_bad < 0) first_bad = i; }
+            if (i) jbuf_append(&j, ",");
+            jbuf_appendf(&j, "{\"i\":%d,\"o\":%lld,\"s\":%lld,\"ok\":%s}",
+                         i, mf.pieces[i].offset, mf.pieces[i].size,
+                         ok ? "true" : "false");
+        }
+        jbuf_appendf(&j, "],\"ok\":%d,\"bad\":%d,\"first_bad\":%d,\"all_ok\":%s}",
+                     okc, badc, first_bad, (badc == 0 ? "true" : "false"));
+        patchdl_manifest_free(&mf);
+        close(fd);
+        return queue_json_owned(conn, MHD_HTTP_OK, j.buf ? j.buf : strdup("{}"));
+    }
+
+    /* Read-only: report the .pkg's embedded content id / title id vs the target
+       (installed app) ids, to expose the cross-region linkage. No install. */
+    if (!strncmp(url, "/api/pkgmeta/", 13)) {
+        const char      *tid = url + 13;
+        char             purl[768] = {0}, pti[32], psti[32], cid[64], nm[128], ver[16];
+        char             dest[320], ecid[64] = {0}, etid[48] = {0}, msg[128], resp[900];
+        patchdl_source_t src;
+        int              en, is_app = 0, rc;
+
+        if (!get_title_action_info(tid, &src, purl, sizeof purl, pti, sizeof pti,
+                                   psti, sizeof psti, cid, sizeof cid,
+                                   nm, sizeof nm, ver, sizeof ver, &en) || !purl[0])
+            return queue_json(conn, MHD_HTTP_NOT_FOUND, "{\"error\":\"unknown title\"}");
+        title_pkg_path(tid, purl, dest, sizeof dest);
+        rc = patchdl_install_pkg_meta(dest, ecid, sizeof ecid, etid, sizeof etid,
+                                      &is_app, msg, sizeof msg);
+        snprintf(resp, sizeof resp,
+                 "{\"ok\":%s,\"pkg_content_id\":\"%s\",\"pkg_title_id\":\"%s\","
+                 "\"is_app\":%s,\"target_content_id\":\"%s\",\"target_title_id\":\"%s\","
+                 "\"storage_title_id\":\"%s\",\"msg\":\"%s\"}",
+                 rc == 0 ? "true" : "false", ecid, etid, is_app ? "true" : "false",
+                 cid, tid, psti, msg);
+        return queue_json_owned(conn, MHD_HTTP_OK, strdup(resp));
+    }
+
     if (!strcmp(url, "/api/netcheck")) {
         char diag[1024] = "{\"error\":\"no title with version_file_uri\"}";
         pthread_mutex_lock(&g_mutex);

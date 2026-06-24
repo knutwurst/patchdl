@@ -31,3 +31,9 @@ int patchdl_install_backend_check(char *msg, size_t msg_sz);
    AppInstUtil/Bgft patch-install symbols and report which exist on this
    firmware. Writes a JSON object into `out`. No install, no side effects. */
 int patchdl_install_api_probe(char *out, size_t out_sz);
+
+/* Read-only: report the .pkg's embedded content id + title id (and whether it
+   is a full app vs a patch, via *is_app). No install. 0 if anything was read. */
+int patchdl_install_pkg_meta(const char *local_path, char *content_id, size_t cid_sz,
+                             char *title_id, size_t tid_sz, int *is_app,
+                             char *msg, size_t msg_sz);

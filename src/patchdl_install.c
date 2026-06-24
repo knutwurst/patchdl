@@ -57,11 +57,13 @@ typedef int (*ai_install_pkg_fn)(const char *path, ai_pkg_info_t *info);
 typedef int (*ai_install_by_pkg_fn)(ai_meta_info_t *meta, ai_pkg_info_t *info,
                                     ai_playgo_info_t *playgo);
 typedef int (*ai_title_from_pkg_fn)(const char *path, char *title_id, int *is_app);
+typedef int (*ai_content_from_pkg_fn)(const char *path, char *content_id, int *is_app);
 
-static ai_init_fn           ai_initialize;
-static ai_install_pkg_fn    ai_install_pkg;
-static ai_install_by_pkg_fn ai_install_by_package;
-static ai_title_from_pkg_fn ai_title_from_pkg;
+static ai_init_fn             ai_initialize;
+static ai_install_pkg_fn      ai_install_pkg;
+static ai_install_by_pkg_fn   ai_install_by_package;
+static ai_title_from_pkg_fn   ai_title_from_pkg;
+static ai_content_from_pkg_fn ai_content_from_pkg;
 
 /* Resolve + initialize the AppInstUtil backend WITHOUT linking the sce libs
    (that makes the ELF unloadable by the elfldr) and WITHOUT raw
@@ -205,6 +207,8 @@ backend_init_thread(void *arg) {
                                                          "sceAppInstUtilInstallByPackage");
     ai_title_from_pkg     = (ai_title_from_pkg_fn)dynsym("libSceAppInstUtil.sprx",
                                                          "sceAppInstUtilGetTitleIdFromPkg");
+    ai_content_from_pkg   = (ai_content_from_pkg_fn)dynsym("libSceAppInstUtil.sprx",
+                                                          "sceAppInstUtilGetContentIdFromPkg");
 
     /* Read-only feasibility probe — module is loaded, safe context. */
     fill_probe();
@@ -282,6 +286,56 @@ patchdl_install_api_probe(char *out, size_t out_sz) {
     snprintf(out, out_sz,
              "{\"pending\":true,\"stage\":\"%s\"}", stage_str(g_stage));
     return -1;
+}
+
+/* Read-only: report the .pkg's embedded content id + title id (and whether it
+   is a full app vs a patch). No install, no side effects. 0 if anything read. */
+int
+patchdl_install_pkg_meta(const char *local_path, char *content_id, size_t cid_sz,
+                         char *title_id, size_t tid_sz, int *is_app,
+                         char *msg, size_t msg_sz) {
+    char        sdk_path[1024];
+    char        cid[64] = {0}, tid[48] = {0};
+    int         app_c = 0, app_t = 0, ok = 0;
+    struct stat st;
+
+    if (content_id && cid_sz) content_id[0] = '\0';
+    if (title_id && tid_sz)   title_id[0]   = '\0';
+    if (is_app) *is_app = 0;
+
+    if (!local_path || !local_path[0] || stat(local_path, &st) != 0) {
+        snprintf(msg, msg_sz, "package not on disk");
+        return -1;
+    }
+    backend_start();
+    if (g_stage != 5) {
+        snprintf(msg, msg_sz, "install backend not ready: %s", stage_str(g_stage));
+        return -1;
+    }
+    if (!strncmp(local_path, "/data/", 6))
+        snprintf(sdk_path, sizeof sdk_path, "/user%s", local_path);
+    else
+        snprintf(sdk_path, sizeof sdk_path, "%s", local_path);
+
+    if (ai_content_from_pkg &&
+        ai_content_from_pkg(sdk_path, cid, &app_c) == 0 && cid[0]) {
+        if (content_id && cid_sz) {
+            strncpy(content_id, cid, cid_sz - 1);
+            content_id[cid_sz - 1] = '\0';
+        }
+        if (is_app) *is_app = app_c;
+        ok = 1;
+    }
+    if (ai_title_from_pkg &&
+        ai_title_from_pkg(sdk_path, tid, &app_t) == 0 && tid[0]) {
+        if (title_id && tid_sz) {
+            strncpy(title_id, tid, tid_sz - 1);
+            title_id[tid_sz - 1] = '\0';
+        }
+        ok = 1;
+    }
+    snprintf(msg, msg_sz, ok ? "ok" : "could not read pkg metadata");
+    return ok ? 0 : -1;
 }
 
 int

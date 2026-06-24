@@ -807,6 +807,41 @@ patchdl_http_download_piece(const char *url, int fd,
     return 0;
 }
 
+/* Read-only: SHA-256 a [offset, offset+size) region of fd into out_hex (>=65
+   bytes). Uses pread so it doesn't disturb the fd offset. 0 on success. */
+int
+patchdl_sha256_fd_region(int fd, long long offset, long long size, char *out_hex) {
+    EVP_MD_CTX   *md;
+    unsigned char *buf;
+    long long      pos = offset, remaining = size;
+    const size_t   CHUNK = 1u << 20;
+
+    out_hex[0] = '\0';
+    if (fd < 0 || size < 0) return -1;
+    md = EVP_MD_CTX_new();
+    if (!md) return -1;
+    buf = malloc(CHUNK);
+    if (!buf) { EVP_MD_CTX_free(md); return -1; }
+    EVP_DigestInit_ex(md, EVP_sha256(), NULL);
+    while (remaining > 0) {
+        size_t  want = remaining > (long long)CHUNK ? CHUNK : (size_t)remaining;
+        ssize_t got  = pread(fd, buf, want, (off_t)pos);
+        if (got <= 0) { free(buf); EVP_MD_CTX_free(md); return -1; }
+        EVP_DigestUpdate(md, buf, (size_t)got);
+        pos += got; remaining -= got;
+    }
+    {
+        unsigned char dig[EVP_MAX_MD_SIZE];
+        unsigned int  dl = 0, i;
+        EVP_DigestFinal_ex(md, dig, &dl);
+        for (i = 0; i < dl; i++) sprintf(out_hex + 2 * i, "%02x", dig[i]);
+        out_hex[2 * dl] = '\0';
+    }
+    free(buf);
+    EVP_MD_CTX_free(md);
+    return 0;
+}
+
 void
 patchdl_manifest_free(patchdl_manifest_t *m) {
     if (!m || !m->pieces) return;
