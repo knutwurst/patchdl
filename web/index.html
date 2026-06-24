@@ -70,6 +70,10 @@
               <h1>Games</h1>
             </div>
             <div class="topbar-actions">
+              <button class="primary-button" id="updateAllBtn" title="Download (and optionally install) every game that has an available, allowed update">
+                <svg><use href="#icon-download"></use></svg>
+                Update all
+              </button>
               <button class="icon-button" id="refreshBtn" title="Refresh status and games" aria-label="Refresh">
                 <svg><use href="#icon-refresh"></use></svg>
               </button>
@@ -105,11 +109,11 @@
               <input id="searchInput" type="search" placeholder="Search title, Title ID, or Content ID" />
             </div>
             <div class="segmented" role="group" aria-label="Filter">
-              <button class="is-selected" data-filter="all" aria-pressed="true">All</button>
-              <button data-filter="updatable" aria-pressed="false">Updatable</button>
+              <button class="is-selected" data-filter="updatable" aria-pressed="true">Updatable</button>
               <button data-filter="uptodate" aria-pressed="false">Up to date</button>
               <button data-filter="needsfw" aria-pressed="false">Needs FW</button>
               <button data-filter="blocked" aria-pressed="false">Can't update</button>
+              <button data-filter="all" aria-pressed="false">All</button>
             </div>
           </div>
 

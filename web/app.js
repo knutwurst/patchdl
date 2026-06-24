@@ -83,7 +83,7 @@ let state = {
   downloads: fallback.downloads,
   logs: fallback.logs,
   view: "games",
-  filter: "all",
+  filter: "updatable",
   query: "",
   usingFallback: false,
 };
@@ -126,6 +126,7 @@ function bindElements() {
     connMinus: document.getElementById("connMinus"),
     connPlus: document.getElementById("connPlus"),
     refreshBtn: document.getElementById("refreshBtn"),
+    updateAllBtn: document.getElementById("updateAllBtn"),
     saveBtn: document.getElementById("saveBtn"),
     clearLogBtn: document.getElementById("clearLogBtn"),
     toast: document.getElementById("toast"),
@@ -155,6 +156,7 @@ function bindEvents() {
   });
 
   els.refreshBtn.addEventListener("click", loadInitialData);
+  if (els.updateAllBtn) els.updateAllBtn.addEventListener("click", updateAll);
   els.saveBtn.addEventListener("click", saveConfig);
   els.clearLogBtn.addEventListener("click", () => { state.logs = []; renderLogs(); });
   if (els.connMinus)
@@ -749,6 +751,27 @@ async function saveConfig() {
 }
 
 /* ---------------- actions (data layer) ---------------- */
+
+// Queue a download for every game that currently has an available, allowed
+// update. The server tolerates duplicate requests (already-queued/active jobs
+// return their existing state), so a second click is harmless. If
+// install_after_download is on, the per-job auto-install pipeline kicks in
+// once each download finishes — no further client action needed.
+async function updateAll() {
+  const targets = state.games.filter((g) =>
+    g.status === "available" && isDownloadAllowed(g) &&
+    !g.downloading && !g.downloaded);
+  if (!targets.length) {
+    showToast("No updates to queue.");
+    return;
+  }
+  showToast(`Queueing ${targets.length} update${targets.length === 1 ? "" : "s"}…`);
+  for (const g of targets) {
+    // Sequential await: the pool returns quickly (202 Accepted) and we want
+    // a stable order in the queue, not a thundering-herd of concurrent POSTs.
+    try { await doDownload(g); } catch (_) { /* per-job errors already toast */ }
+  }
+}
 
 // Enqueue a download. The pool returns immediately (202); progress, completion
 // and (if configured) auto-install are driven by reconcileFromJobs() on poll.
