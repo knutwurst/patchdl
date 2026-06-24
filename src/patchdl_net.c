@@ -22,6 +22,17 @@
 #define DNS_PORT       53
 #define DNS_TIMEOUT_MS 3000
 
+/* Manifest sanity caps — reject anything bigger than a real PS5 patch. The
+   largest title we've seen tops out around 70 GB / 18 pieces. */
+#define PATCHDL_MAX_PIECES         4096
+#define PATCHDL_MAX_PIECE_BYTES    (8ULL  * 1024 * 1024 * 1024)   /* 8 GiB  */
+#define PATCHDL_MAX_TOTAL_BYTES    (200ULL * 1024 * 1024 * 1024)  /* 200 GiB */
+
+/* In-RAM buffer caps for full HTTP body fetches. version.xml is a few KB,
+   manifest JSON is a few MB at most — fail-closed beyond that. */
+#define PATCHDL_BUF_MAX_VERXML     (16  * 1024 * 1024)
+#define PATCHDL_BUF_MAX_MANIFEST   (64  * 1024 * 1024)
+
 #ifdef PATCHDL_HAVE_CURL
 
 static const char *ALLOWED_HOSTS[] = {
@@ -35,13 +46,15 @@ static const char *ALLOWED_HOSTS[] = {
 static int
 host_allowed(const char *host) {
     size_t hlen = strlen(host);
+    /* DNS is case-insensitive; an upstream redirect to "SGST.prod..." would
+       otherwise drop out of the allowlist. */
     for (int i = 0; ALLOWED_HOSTS[i]; i++) {
-        if (!strcmp(host, ALLOWED_HOSTS[i]))
+        if (!strcasecmp(host, ALLOWED_HOSTS[i]))
             return 1;
         size_t alen = strlen(ALLOWED_HOSTS[i]);
         if (hlen > alen + 1 &&
             host[hlen - alen - 1] == '.' &&
-            !strcmp(host + hlen - alen, ALLOWED_HOSTS[i]))
+            !strcasecmp(host + hlen - alen, ALLOWED_HOSTS[i]))
             return 1;
     }
     return 0;
@@ -145,6 +158,10 @@ dns_resolve(const char *host, char *ip_out, size_t ip_sz) {
     while (pos < (size_t)n) {
         if (!resp[pos]) { pos++; break; }
         if ((resp[pos] & 0xC0) == 0xC0) { pos += 2; break; }
+        /* Bounds-check the label length BEFORE the increment — a malformed
+           response with a 0xFF label byte near the end would otherwise walk
+           past `n`. */
+        if (pos + 1 + (size_t)resp[pos] >= (size_t)n) { g_dns_step = 5; return -1; }
         pos += 1 + resp[pos];
     }
     if (pos + 4 > (size_t)n) { g_dns_step = 5; return -1; }
@@ -156,8 +173,10 @@ dns_resolve(const char *host, char *ip_out, size_t ip_sz) {
         if ((resp[pos] & 0xC0) == 0xC0) {
             pos += 2;
         } else {
-            while (pos < (size_t)n && resp[pos])
+            while (pos < (size_t)n && resp[pos]) {
+                if (pos + 1 + (size_t)resp[pos] >= (size_t)n) break;
                 pos += 1 + resp[pos];
+            }
             pos++;
         }
         if (pos + 10 > (size_t)n) break;
@@ -222,7 +241,12 @@ static size_t
 write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
     patchdl_buf_t *b     = userdata;
     size_t         total = size * nmemb;
-    char          *newp  = realloc(b->data, b->size + total + 1);
+    char          *newp;
+    /* Overflow guard before the cap check (b->size+total may wrap on 32-bit). */
+    if (total > (size_t)-1 - b->size - 1) return 0;
+    /* Cap accumulation so a hostile CDN can't drive unbounded RAM growth. */
+    if (b->max && b->size + total > b->max) return 0;
+    newp = realloc(b->data, b->size + total + 1);
     if (!newp) return 0;
     b->data = newp;
     memcpy(b->data + b->size, ptr, total);
@@ -252,7 +276,11 @@ patchdl_http_get(const char *url, patchdl_buf_t *out) {
     snprintf(resolve_80, sizeof(resolve_80), "%s:80:%s", host, ip);
     resolve_list = curl_slist_append(resolve_list, resolve_80);
 
-    memset(out, 0, sizeof(*out));
+    {
+        size_t caller_max = out->max;
+        memset(out, 0, sizeof(*out));
+        out->max = caller_max;
+    }
 
     curl = curl_easy_init();
     if (!curl) { curl_slist_free_all(resolve_list); return -1; }
@@ -277,6 +305,12 @@ patchdl_http_get(const char *url, patchdl_buf_t *out) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,         15L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,  1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS,       3L);
+    /* Redirects must stay on HTTPS — host_allowed gates the initial URL, but
+       once libcurl follows a 302 we want the protocol pinned too. The _STR
+       variants replaced the bitfield options in libcurl 7.85. */
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR,       "https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,        1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT,       "patchdl/1.0");
 
     res = curl_easy_perform(curl);
@@ -473,8 +507,24 @@ patchdl_http_download(const char *url, const char *dest_path,
     return patchdl_http_download_progress(url, dest_path, bytes_out, NULL, NULL);
 }
 
+/* Substring scan bounded to [p, limit). NULL limit means search to NUL.
+   Returns NULL if needle is not found before limit. */
+static const char *
+strstr_bounded(const char *p, const char *needle, const char *limit) {
+    const char *hit = strstr(p, needle);
+    if (!hit) return NULL;
+    if (limit && hit >= limit) return NULL;
+    return hit;
+}
+
+/* Read "key": "value" starting from p. Search and read are bounded by `limit`
+   (pass NULL to search to end of buffer). Decodes \\ \" \/ \n \r \t \b \f; any
+   other \X is copied without the backslash. \uXXXX is left as the raw 6 bytes
+   (we don't need Unicode for manifest fields). limit==NULL keeps legacy
+   end-of-string scope for callers that don't need the cap. */
 static int
-json_string_after(const char *p, const char *key, char *out, size_t out_sz) {
+json_string_after(const char *p, const char *key, char *out, size_t out_sz,
+                  const char *limit) {
     char needle[48];
     const char *q;
     size_t n = 0;
@@ -482,35 +532,59 @@ json_string_after(const char *p, const char *key, char *out, size_t out_sz) {
     if (!p || !out || out_sz == 0) return -1;
     out[0] = '\0';
     snprintf(needle, sizeof(needle), "\"%s\"", key);
-    q = strstr(p, needle);
+    q = strstr_bounded(p, needle, limit);
     if (!q) return -1;
     q += strlen(needle);
-    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+    while ((!limit || q < limit) &&
+           (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')) q++;
+    if (limit && q >= limit) return -1;
     if (*q++ != ':') return -1;
-    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+    while ((!limit || q < limit) &&
+           (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')) q++;
+    if (limit && q >= limit) return -1;
     if (*q++ != '"') return -1;
 
-    while (*q && *q != '"' && n + 1 < out_sz) {
-        if (*q == '\\' && q[1]) q++;
-        out[n++] = *q++;
+    while ((!limit || q < limit) && *q && *q != '"' && n + 1 < out_sz) {
+        if (*q == '\\' && q[1] && (!limit || q + 1 < limit)) {
+            q++;
+            switch (*q) {
+            case '"':  out[n++] = '"';  break;
+            case '\\': out[n++] = '\\'; break;
+            case '/':  out[n++] = '/';  break;
+            case 'n':  out[n++] = '\n'; break;
+            case 'r':  out[n++] = '\r'; break;
+            case 't':  out[n++] = '\t'; break;
+            case 'b':  out[n++] = '\b'; break;
+            case 'f':  out[n++] = '\f'; break;
+            default:   out[n++] = *q;   break; /* unknown escape: keep payload */
+            }
+            q++;
+        } else {
+            out[n++] = *q++;
+        }
     }
     out[n] = '\0';
     return n ? 0 : -1;
 }
 
 static int
-json_u64_after(const char *p, const char *key, unsigned long long *out) {
+json_u64_after(const char *p, const char *key, unsigned long long *out,
+               const char *limit) {
     char needle[48];
     const char *q;
 
     if (!p || !out) return -1;
     snprintf(needle, sizeof(needle), "\"%s\"", key);
-    q = strstr(p, needle);
+    q = strstr_bounded(p, needle, limit);
     if (!q) return -1;
     q += strlen(needle);
-    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+    while ((!limit || q < limit) &&
+           (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')) q++;
+    if (limit && q >= limit) return -1;
     if (*q++ != ':') return -1;
-    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+    while ((!limit || q < limit) &&
+           (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')) q++;
+    if (limit && q >= limit) return -1;
     if (*q < '0' || *q > '9') return -1;
     *out = strtoull(q, NULL, 10);
     return 0;
@@ -530,6 +604,8 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
     int count = 0, started, rc = -1;
 
     if (bytes_out) *bytes_out = 0;
+    memset(&manifest, 0, sizeof(manifest));
+    manifest.max = PATCHDL_BUF_MAX_MANIFEST;
     if (patchdl_http_get(manifest_url, &manifest))
         return -1;
     if (!manifest.data || !manifest.size) {
@@ -545,7 +621,7 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
     /* Bound the scan to the pieces array; otherwise a later "url" key in the
        manifest (e.g. playgoChunkCrcUrl) could be appended as a bogus piece. */
     pieces_end = strchr(pieces, ']');
-    json_u64_after(manifest.data, "originalFileSize", &manifest_total);
+    json_u64_after(manifest.data, "originalFileSize", &manifest_total, NULL);
 
     /* Resume: reopen the existing partial and keep its bytes; else start clean.
        Fully-downloaded pieces are skipped; the one piece that was only partially
@@ -569,11 +645,13 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
         int have_offset, drc;
         const char *want_hash;
         const char *obj_end = strchr(p, '}');
+        const char *piece_limit = (obj_end && (!pieces_end || obj_end < pieces_end))
+                                  ? obj_end : pieces_end;
 
-        if (json_string_after(p, "url", url, sizeof(url)))
+        if (json_string_after(p, "url", url, sizeof(url), piece_limit))
             break;
-        json_u64_after(p, "fileSize", &expected);
-        have_offset = (json_u64_after(p, "fileOffset", &offset) == 0);
+        json_u64_after(p, "fileSize", &expected, piece_limit);
+        have_offset = (json_u64_after(p, "fileOffset", &offset, piece_limit) == 0);
 
         /* Piece already fully present from a previous run: skip the download. */
         if (!started && have_offset && expected &&
@@ -614,7 +692,7 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
         /* A ranged piece can't be hashed (only its tail is fetched). */
         want_hash = NULL;
         if (range_start == 0 && verify) {
-            json_string_after(p, "hashValue", hash, sizeof(hash));
+            json_string_after(p, "hashValue", hash, sizeof(hash), piece_limit);
             want_hash = hash[0] ? hash : NULL;
         }
 
@@ -634,7 +712,8 @@ patchdl_http_download_manifest_progress(const char *manifest_url,
                 total = (long long)offset;
                 range_start = 0;
                 if (verify) {
-                    json_string_after(p, "hashValue", hash, sizeof(hash));
+                    json_string_after(p, "hashValue", hash, sizeof(hash),
+                                      piece_limit);
                     want_hash = hash[0] ? hash : NULL;
                 }
                 progress.base = total;
@@ -859,6 +938,8 @@ patchdl_fetch_manifest(const char *manifest_url, patchdl_manifest_t *out) {
     long long running = 0;
 
     memset(out, 0, sizeof(*out));
+    memset(&buf, 0, sizeof(buf));
+    buf.max = PATCHDL_BUF_MAX_MANIFEST;
     if (patchdl_http_get(manifest_url, &buf)) return -1;
     if (!buf.data || !buf.size) { free(buf.data); return -1; }
 
@@ -872,20 +953,33 @@ patchdl_fetch_manifest(const char *manifest_url, patchdl_manifest_t *out) {
     out->pieces = calloc((size_t)cap, sizeof(patchdl_piece_t));
     if (!out->pieces) { free(buf.data); return -1; }
 
+    /* Sanity caps: refuse a manifest that would let a CDN drive multi-TB
+       allocations or millions of pieces. The biggest real PS5 patch we've
+       seen is ~70 GB / 18 pieces; these limits leave room to spare. */
+    if (cap > PATCHDL_MAX_PIECES) { free(buf.data); return -1; }
+
     p = pieces;
     while ((p = strstr(p, "\"url\"")) && (!pieces_end || p < pieces_end) && n < cap) {
         char               url[768] = {0};
         unsigned long long sz = 0, off = 0;
         const char        *obj_end = strchr(p, '}');
+        const char        *piece_limit = (obj_end && (!pieces_end || obj_end < pieces_end))
+                                         ? obj_end : pieces_end;
 
-        if (json_string_after(p, "url", url, sizeof(url)))
+        if (json_string_after(p, "url", url, sizeof(url), piece_limit))
             break;
-        json_u64_after(p, "fileSize", &sz);
-        if (json_u64_after(p, "fileOffset", &off) != 0)
+        json_u64_after(p, "fileSize", &sz, piece_limit);
+        if (json_u64_after(p, "fileOffset", &off, piece_limit) != 0)
             off = (unsigned long long)running;   /* no offset -> assume contiguous */
 
-        /* Validate tiling: pieces must be in order, contiguous, non-empty. */
-        if ((long long)off != running || sz == 0) {
+        /* Validate tiling: pieces must be in order, contiguous, non-empty,
+           and each individually under the per-piece cap. */
+        if ((long long)off != running || sz == 0 || sz > PATCHDL_MAX_PIECE_BYTES) {
+            patchdl_manifest_free(out);
+            free(buf.data);
+            return -1;
+        }
+        if ((unsigned long long)running + sz > PATCHDL_MAX_TOTAL_BYTES) {
             patchdl_manifest_free(out);
             free(buf.data);
             return -1;
@@ -894,7 +988,7 @@ patchdl_fetch_manifest(const char *manifest_url, patchdl_manifest_t *out) {
         out->pieces[n].offset = (long long)off;
         out->pieces[n].size   = (long long)sz;
         json_string_after(p, "hashValue", out->pieces[n].hash,
-                          sizeof(out->pieces[n].hash));
+                          sizeof(out->pieces[n].hash), piece_limit);
         if (!out->pieces[n].url) {
             patchdl_manifest_free(out);
             free(buf.data);

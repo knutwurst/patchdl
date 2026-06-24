@@ -6,6 +6,7 @@ typedef struct {
     char  *data;
     size_t size;
     size_t cap;
+    size_t max;     /* 0 = unbounded (legacy). Otherwise write_cb fails past this. */
 } patchdl_buf_t;
 
 patchdl_buf_t *patchdl_buf_new(void);

@@ -66,14 +66,20 @@ ver_gt(const char *a, const char *b) {
    from a string such as nptitleid, manifest_url, or delta_url. */
 static void
 extract_title_id(const char *s, char *out, size_t sz) {
+    size_t len;
     out[0] = '\0';
     if (sz < 10 || !s) return;
-    for (const char *p = s; p[0] && p[8]; p++) {
+    len = strlen(s);
+    if (len < 9) return;
+    /* `len - 9` is the last position where a 9-char id can still fit; this
+       avoids reading p[8] past the NUL terminator. */
+    for (size_t i = 0; i <= len - 9; i++) {
+        const char *p = s + i;
         int ok = 1;
-        for (int i = 0; i < 4 && ok; i++)
-            if (p[i] < 'A' || p[i] > 'Z') ok = 0;
-        for (int i = 4; i < 9 && ok; i++)
-            if (p[i] < '0' || p[i] > '9') ok = 0;
+        for (int k = 0; k < 4 && ok; k++)
+            if (p[k] < 'A' || p[k] > 'Z') ok = 0;
+        for (int k = 4; k < 9 && ok; k++)
+            if (p[k] < '0' || p[k] > '9') ok = 0;
         if (ok) {
             memcpy(out, p, 9);
             out[9] = '\0';
@@ -177,6 +183,10 @@ patchdl_verxml_query(const char *url, uint32_t fw_bin, patchdl_verinfo_t *out) {
     if (!url || !out) return -1;
     memset(out, 0, sizeof(*out));
 
+    /* version.xml is a few KB in practice; cap to 16 MiB so a misbehaving CDN
+       can't slurp unbounded RAM into the buffer. */
+    memset(&buf, 0, sizeof(buf));
+    buf.max = 16 * 1024 * 1024;
     if (patchdl_http_get(url, &buf)) return -1;
     if (!buf.data || !buf.size) { free(buf.data); return -1; }
 
