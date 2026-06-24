@@ -19,7 +19,7 @@ VERSION=$(sed -n 's/.*PATCHDL_VERSION[^"]*"\([^"]*\)".*/\1/p' "$ROOT_DIR/src/pat
 SRC_ELF="$ROOT_DIR/patchdl-ps5.elf"
 [ -f "$SRC_ELF" ] || { echo "build first: $SRC_ELF missing" >&2; exit 1; }
 
-UP_NAME="patchdl-ps5-v${VERSION}.elf"
+UP_NAME="patchdl_${VERSION}.elf"
 TMP_ELF="$ROOT_DIR/$UP_NAME"
 cp "$SRC_ELF" "$TMP_ELF"
 

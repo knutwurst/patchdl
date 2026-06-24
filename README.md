@@ -45,6 +45,22 @@ Downloads survive interruptions:
 Patches download to `/data/patchdl` on the internal SSD. Large retail updates
 run tens of GB.
 
+## Web UI
+
+The Games view groups titles into filter chips:
+
+- **Updatable** — has an installable update; selected by default.
+- **Updating** — queued, actively downloading, paused with a partial on disk,
+  or installing.
+- **Up to date**, **Needs FW**, **Can't update** — the rest.
+- **All** — flat list at the right end of the strip.
+
+**Update all** in the top bar queues a download for every game with an
+installable update in one click. Shadowmounts are skipped (they pass the
+download policy but not the install policy), so a sweep doesn't burn tens of
+GB on bytes AppInstUtil would refuse — pick those up by hand when the disc is
+ready.
+
 ## Safety model
 
 Deny-by-default. A patch installs only for a genuine install, and only when the
@@ -88,8 +104,9 @@ scripts/build_ps5.sh        # produces patchdl-ps5.elf
 ## Deploy
 
 This console uses the BD-JB autoloader with itsPLK's Payload Manager on port 8084
-(not a 9021 elfldr). `scripts/deploy_ps5.sh` uploads the version-named ELF and
-launches it; the payload replaces any running instance.
+(not a 9021 elfldr). `scripts/deploy_ps5.sh` uploads the version-named ELF
+(`patchdl_<version>.elf`, so Payload Manager picks the version out of the
+filename) and launches it; the payload replaces any running instance.
 
 ```sh
 PS5_HOST=<console-ip> scripts/deploy_ps5.sh
@@ -105,23 +122,19 @@ http://<console-ip>:12880/
 
 Verified on firmware 11.60: title scan, source classification, version
 resolution past the nanoDNS block, firmware-compatibility filtering, the parallel
-download pool, reboot-safe resume, and on-device SHA-256 verification. A full
-Dead Island 2 update (61.6 GB) downloaded and verified byte-perfect across
-several reboots.
+download pool, reboot-safe resume, and on-device SHA-256 verification.
 
-Install works for same-region patches, where Sony stores the patch bytes under
-the installed game's own title id. PatchDL now mirrors etaHEN's native
-DirectPKGInstaller call shape for that path: it passes an empty
-`MetaInfo.content_id`, lets AppInstUtil bind the signed package metadata, keeps
-the returned content id, and exposes `/api/installstatus` for installer progress
-when `sceAppInstUtilGetInstallStatus` is exported.
+Install works through Sony's AppInstUtil. `sceAppInstUtilInstallByPackage` is
+unavailable from the homebrew payload context (rejected with `0x80B21163`
+outside the system process), so PatchDL routes through
+`sceAppInstUtilAppInstallPkg` — the simpler API that reads the PKG's embedded
+`content_id` and binds the install to the right title slot. Verified
+end-to-end: Dead Island 2 (`PPSA03099`) updated from 01.000.001 to 01.000.011
+on 11.60, including the cross-region shared-storage case where Sony serves the
+patch under a master title id.
 
-Cross-region patches are a known limitation. Sony sometimes packages a regional
-patch under a different (master) storage title and ships it as a debug-magic
-container. PatchDL downloads such a patch and verifies it against Sony's hashes,
-but refuses to install it from the standalone ELF because `InstallByPackage`
-does not retarget signed package metadata on 11.60, and the homebrew alternative
-(BGFT register) returns "not supported" outside the system process. Installing
-that class of patch needs Sony's authenticated updater, which nanoDNS blocks.
-Disc games need the disc inserted for their patch to apply, which is a normal
-Sony requirement.
+`/api/installstatus` reports installer progress once
+`sceAppInstUtilGetInstallStatus` finishes the queued task.
+
+Disc games still need the disc inserted for their patch to apply, which is a
+normal Sony requirement; that's why shadowmounts are download-only by policy.
