@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -614,16 +615,23 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
        carry a different title id than the installed game; passing content_id
        is what etaHEN does to route the install correctly. */
     {
-        char             file_uri[1100];
-        char             http_loop_uri[1200] = {0};
-        char             http_lan_uri[1200] = {0};
-        const char      *uris[4];
-        ai_meta_info_t   meta   = {0};
-        ai_pkg_info_t    pkg    = {0};
-        ai_playgo_info_t playgo = {0};
-        int              rc2    = -1;
-        const char      *title_dir;
-        const char      *file_base;
+        char              file_uri[1100];
+        char              http_loop_uri[1200] = {0};
+        char              http_lan_uri[1200] = {0};
+        const char       *uris[4];
+        ai_meta_info_t    meta    = {0};
+        ai_pkg_info_t     pkg     = {0};
+        /* playgo is 0x2700 bytes — too big for the MHD worker stack alongside
+           uris, meta, pkg, resp buffers, and Sony's own frame use. */
+        ai_playgo_info_t *playgo  = calloc(1, sizeof(*playgo));
+        int               rc2     = -1;
+        const char       *title_dir;
+        const char       *file_base;
+
+        if (!playgo) {
+            snprintf(msg, msg_sz, "out of memory");
+            return -1;
+        }
 
         snprintf(file_uri, sizeof(file_uri), "file://%s", sdk_path);
         title_dir = strstr(local_path, "/data/patchdl/");
@@ -670,9 +678,9 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
             for (int i = 0; i < 4; i++) {
                 if (!uris[i]) continue;
                 memset(&pkg, 0, sizeof(pkg));
-                memset(&playgo, 0, sizeof(playgo));
+                memset(playgo, 0, sizeof(*playgo));
                 meta.uri = uris[i];
-                rc2 = ai_install_by_package(&meta, &pkg, &playgo);
+                rc2 = ai_install_by_package(&meta, &pkg, playgo);
                 {
                     size_t l = strlen(tries);
                     snprintf(tries + l, sizeof(tries) - l, "%s%s=0x%08x",
@@ -684,11 +692,13 @@ patchdl_install_local_pkg(const char *local_path, const char *expected_title_id,
                     snprintf(msg, msg_sz, "install started (InstallByPackage, content %.47s)",
                              pkg.content_id[0] ? pkg.content_id :
                              (target_content_id ? target_content_id : ""));
+                    free(playgo);
                     return 0;
                 }
             }
             rc = rc2;
         }
+        free(playgo);
     }
 
     /* AppInstallPkg: simpler API, no MetaInfo content_id override. Tried for
@@ -735,9 +745,9 @@ int
 patchdl_install_by_uri(const char *uri, const char *target_title_id,
                        const char *target_content_id,
                        char *msg, size_t msg_sz) {
-    ai_meta_info_t   meta   = {0};
-    ai_pkg_info_t    pkg    = {0};
-    ai_playgo_info_t playgo = {0};
+    ai_meta_info_t    meta   = {0};
+    ai_pkg_info_t     pkg    = {0};
+    ai_playgo_info_t *playgo;
     int rc;
 
     if (!uri || !uri[0]) {
@@ -749,6 +759,8 @@ patchdl_install_by_uri(const char *uri, const char *target_title_id,
         snprintf(msg, msg_sz, "install backend not ready: %s", stage_str(g_stage));
         return -1;
     }
+    playgo = calloc(1, sizeof(*playgo));
+    if (!playgo) { snprintf(msg, msg_sz, "out of memory"); return -1; }
 
     meta.uri                = uri;
     meta.ex_uri             = "";
@@ -757,8 +769,9 @@ patchdl_install_by_uri(const char *uri, const char *target_title_id,
     meta.content_name       = "PatchDL";
     meta.icon_url           = "";
 
-    rc = ai_install_by_package(&meta, &pkg, &playgo);
+    rc = ai_install_by_package(&meta, &pkg, playgo);
     remember_install(target_title_id, "InstallByURI", &pkg, target_content_id, rc);
+    free(playgo);
 
     if (rc == 0) {
         snprintf(msg, msg_sz, "install started (InstallByPackage/uri, content %.47s)",

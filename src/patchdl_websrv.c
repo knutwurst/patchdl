@@ -811,9 +811,12 @@ build_downloads_json(void) {
    here at the next scan — not during the async install, which still reads the
    file. */
 static void
+title_pkg_path(const char *title_id, const char *patch_url,
+               char *out, size_t out_sz);
+
+static void
 cleanup_installed_download(const char *title_id, const char *patch_url) {
     char        dir[256], path[320];
-    const char *base = strrchr(patch_url, '/');
     if (!path_segment_safe(title_id))
         return;
     /* Never delete a directory the download pool still owns (a queued/active/
@@ -825,9 +828,11 @@ cleanup_installed_download(const char *title_id, const char *patch_url) {
             return;
         }
     pthread_mutex_unlock(&g_pool.mtx);
-    base = base ? base + 1 : "patch.pkg";
     snprintf(dir, sizeof(dir), "/data/patchdl/%s", title_id);
-    snprintf(path, sizeof(path), "%s/%s", dir, base);
+    /* Reuse title_pkg_path so the basename is validated the same way as on
+       download — a basename with .. or delimiters falls back to "<tid>.pkg"
+       and we don't end up unlinking outside the title directory. */
+    title_pkg_path(title_id, patch_url, path, sizeof(path));
     unlink(path);
     rmdir(dir);
 }
@@ -942,7 +947,12 @@ set_title_enabled(struct MHD_Connection *conn, const char *title_id, int en) {
     return queue_json_owned(conn, MHD_HTTP_OK, strdup(r));
 }
 
-/* Local on-disk path a title's patch downloads to / installs from. */
+/* Local on-disk path a title's patch downloads to / installs from. The
+   basename comes from the patch_url (CDN-controlled), so it MUST be
+   validated — a malicious or corrupted version.xml could otherwise yield
+   "..", an empty string, or a path with delimiters that escape the title
+   directory when concatenated. Fallback to a deterministic per-title name
+   on any rejection so file ops still land somewhere safe. */
 static void
 title_pkg_path(const char *title_id, const char *patch_url,
                char *out, size_t out_sz) {
@@ -950,11 +960,15 @@ title_pkg_path(const char *title_id, const char *patch_url,
     char name[192];
     size_t n;
 
-    base = base ? base + 1 : "patch.pkg";
+    base = base ? base + 1 : "";
     snprintf(name, sizeof(name), "%s", base);
     n = strlen(name);
     if (n > 5 && !strcmp(name + n - 5, ".json"))
         snprintf(name + n - 5, sizeof(name) - (n - 5), ".pkg");
+    if (!name[0] || !path_segment_safe(name)) {
+        snprintf(name, sizeof(name), "%s.pkg",
+                 path_segment_safe(title_id) ? title_id : "patch");
+    }
     snprintf(out, out_sz, "%s/%s/%s", PATCHDL_DL_DIR, title_id, name);
 }
 
@@ -1777,10 +1791,15 @@ handle_title_action(struct MHD_Connection *conn, const char *url) {
 /* ---------- POST body accumulation ------------------------------------- */
 
 /* MHD delivers a POST body across several callback invocations. We stash a
-   growing buffer in con_cls and dispatch once the body is complete. */
+   growing buffer in con_cls and dispatch once the body is complete. The
+   largest legitimate body we accept is the config JSON or a small install
+   request — a few hundred bytes; 64 KiB leaves ample headroom while keeping
+   a misbehaving LAN client from forcing unbounded allocations. */
+#define PATCHDL_POST_MAX_BYTES (64 * 1024)
 typedef struct {
     char  *data;
     size_t len;
+    int    oversized;
 } post_body_t;
 
 static void
@@ -1857,17 +1876,27 @@ on_request(void *cls, struct MHD_Connection *conn, const char *url,
         }
 
         if (*upload_data_size) {            /* a body chunk: append it */
-            char *n = realloc(pb->data, pb->len + *upload_data_size + 1);
-            if (n) {
-                memcpy(n + pb->len, upload_data, *upload_data_size);
-                pb->len += *upload_data_size;
-                n[pb->len] = '\0';
-                pb->data = n;
+            if (!pb->oversized &&
+                pb->len + *upload_data_size <= PATCHDL_POST_MAX_BYTES) {
+                char *n = realloc(pb->data, pb->len + *upload_data_size + 1);
+                if (n) {
+                    memcpy(n + pb->len, upload_data, *upload_data_size);
+                    pb->len += *upload_data_size;
+                    n[pb->len] = '\0';
+                    pb->data = n;
+                } else {
+                    pb->oversized = 1;
+                }
+            } else {
+                pb->oversized = 1;     /* drop further chunks to bound RAM */
             }
             *upload_data_size = 0;
             return MHD_YES;
         }
 
+        if (pb->oversized)
+            return queue_json(conn, MHD_HTTP_CONTENT_TOO_LARGE,
+                              "{\"ok\":false,\"reason\":\"body_too_large\"}");
         /* final call: the full body (if any) is in pb->data */
         const char *body = pb->data ? pb->data : "";
         if (!strcmp(url, "/api/config"))
