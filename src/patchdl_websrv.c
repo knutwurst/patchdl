@@ -105,7 +105,10 @@ static struct {
     dl_job_t       *active;            /* the one admitted job, or NULL */
     int             admitting;         /* a worker is fetching/preallocating next job */
     int             stopping;
-    int             n_workers;
+    int             n_workers;         /* threads actually spawned (== POOL_MAX_CONN) */
+    int             active_conns;      /* live connection limit (1..n_workers); a worker
+                                          with slot >= active_conns idles. Changing this
+                                          + broadcast resizes the pool with no restart. */
     pthread_t       workers[POOL_MAX_CONN];
     volatile long long inflight_bytes[POOL_MAX_CONN]; /* per-slot live counters */
 } g_pool = { .mtx = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
@@ -1274,6 +1277,14 @@ dl_worker(void *arg) {
         pthread_mutex_lock(&g_pool.mtx);
         for (;;) {
             if (g_pool.stopping) break;
+            /* Live connection limit: a worker above the configured count idles
+               here (claims no new piece, doesn't admit). Lowering active_conns
+               lets in-flight pieces finish first, then those workers park here;
+               raising it wakes them to start pulling pieces — no restart. */
+            if (slot >= g_pool.active_conns) {
+                pthread_cond_wait(&g_pool.cv, &g_pool.mtx);
+                continue;
+            }
             job = g_pool.active;
             if (!job) {
                 if (!g_pool.admitting) {
@@ -1677,6 +1688,7 @@ request_completed(void *cls, struct MHD_Connection *conn, void **con_cls,
 static enum MHD_Result
 handle_config_post(struct MHD_Connection *conn, const char *body) {
     char pol[8];
+    int  mc;
 
     json_get_str(body, "default_policy", pol, sizeof(pol));
 
@@ -1697,7 +1709,19 @@ handle_config_post(struct MHD_Connection *conn, const char *body) {
         json_get_int(body, "max_connections", g_cfg.max_connections);
     if (g_cfg.max_connections < 1) g_cfg.max_connections = 1;
     if (g_cfg.max_connections > POOL_MAX_CONN) g_cfg.max_connections = POOL_MAX_CONN;
+    mc = g_cfg.max_connections;
     pthread_mutex_unlock(&g_mutex);
+
+    /* Apply the new connection count to the live pool — no restart. Raising it
+       wakes idle workers to pull pieces immediately; lowering it lets the extra
+       workers finish their current piece, then they park. (g_mutex released
+       first to keep the g_mutex-before-g_pool lock order.) */
+    pthread_mutex_lock(&g_pool.mtx);
+    g_pool.active_conns = mc;
+    if (g_pool.active_conns < 1) g_pool.active_conns = 1;
+    if (g_pool.active_conns > g_pool.n_workers) g_pool.active_conns = g_pool.n_workers;
+    pthread_cond_broadcast(&g_pool.cv);
+    pthread_mutex_unlock(&g_pool.mtx);
 
     save_config();
     return queue_json_owned(conn, MHD_HTTP_OK, build_config_json());
@@ -1857,16 +1881,31 @@ patchdl_websrv_start(unsigned short port) {
        download workers race their first curl_easy_init. */
     patchdl_net_global_init();
 
-    /* Spawn the N-connection download pool BEFORE the web server accepts work. */
-    g_pool.n_workers = g_cfg.max_connections;
-    if (g_pool.n_workers < 1) g_pool.n_workers = 1;
-    if (g_pool.n_workers > POOL_MAX_CONN) g_pool.n_workers = POOL_MAX_CONN;
+    /* Spawn the full set of workers BEFORE the web server accepts work, then
+       cap how many are *active* with g_pool.active_conns. Spawning all of them
+       up front lets the connection count be raised live (up to POOL_MAX_CONN)
+       without creating threads at runtime; idle workers just wait on the cv.
+       active_conns/n_workers are set before the first pthread_create so every
+       worker reads a valid limit from its gate (no startup data race). */
+    g_pool.n_workers   = POOL_MAX_CONN;
+    g_pool.active_conns = g_cfg.max_connections;
+    if (g_pool.active_conns < 1) g_pool.active_conns = 1;
+    if (g_pool.active_conns > POOL_MAX_CONN) g_pool.active_conns = POOL_MAX_CONN;
     g_pool.stopping = 0;
-    for (int s = 0; s < g_pool.n_workers; s++) {
-        if (pthread_create(&g_pool.workers[s], NULL, dl_worker,
-                           (void *)(intptr_t)s)) {
-            g_pool.n_workers = s;   /* only the threads that started exist */
-            break;
+    {
+        int spawned = 0;
+        for (int s = 0; s < POOL_MAX_CONN; s++) {
+            if (pthread_create(&g_pool.workers[s], NULL, dl_worker,
+                               (void *)(intptr_t)s))
+                break;             /* only the threads that started exist */
+            spawned++;
+        }
+        if (spawned < g_pool.n_workers) {
+            pthread_mutex_lock(&g_pool.mtx);
+            g_pool.n_workers = spawned;
+            if (g_pool.active_conns > g_pool.n_workers)
+                g_pool.active_conns = g_pool.n_workers;
+            pthread_mutex_unlock(&g_pool.mtx);
         }
     }
 
