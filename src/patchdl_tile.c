@@ -1,3 +1,12 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 Knutwurst
+ *
+ * PatchDL is free software: you can redistribute it and/or modify it under
+ * the terms of the GNU General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option)
+ * any later version. See the LICENSE file in the project root for details.
+ */
+
 #include "patchdl_tile.h"
 #include "patchdl_install.h"
 
@@ -14,7 +23,7 @@
 #include <ps5/kernel.h>
 
 /* Embed the tile assets into .rodata directly via .incbin — no codegen step,
-   no Python helper, no second translation unit. Matches itsPLK's pattern. */
+   no Python helper, no second translation unit. */
 #define INCASSET(name, file)                                                  \
     __asm__(".section .rodata\n"                                              \
             ".global " #name "\n"                                             \
@@ -150,8 +159,8 @@ patchdl_tile_install_if_needed(char *msg, size_t msg_sz) {
     }
 
     /* Resolve the install API now so we can fail fast before touching disk.
-       itsPLK uses the NID (Wudg3Xe3heE) because the symbol export is
-       Sony-private; try both, NID first since it survives a stripped sprx. */
+       The symbol export is Sony-private, so the NID resolver is the more
+       reliable lookup — try NID first, fall back to the by-name dlsym. */
     ai_install_title = (ai_install_dir_fn)dynsym_by_nid("Wudg3Xe3heE");
     if (!ai_install_title)
         ai_install_title = (ai_install_dir_fn)dynsym_by_name(

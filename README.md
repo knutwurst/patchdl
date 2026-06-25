@@ -93,4 +93,9 @@ PS5_HOST=<console-ip> scripts/deploy_ps5.sh
 
 ## License
 
-by Knutwurst
+PatchDL is released under the **GNU General Public License v3.0 or later**.
+See [LICENSE](LICENSE) for the full text. In short: you're free to use, study,
+modify and share it — and any fork or derivative work has to stay under the
+same license.
+
+Copyright © 2026 Knutwurst.
