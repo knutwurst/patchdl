@@ -10,15 +10,15 @@ same network, pick the games you want patched.
 
 ## What it does
 
-- Lists every game installed on your console and looks up the newest update
-  Sony has published for it.
-- Compares the available patch against your firmware and only offers updates
-  that will actually run on the system you have.
-- Downloads the update package into internal storage and installs it
-  on-console — same end result as a normal system update, with you in control
-  of when and what.
-- Pauses, resumes, and survives reboots: a 60 GB patch can be picked up where
-  it left off after a power-cycle.
+- Lists every installed game on your console and looks up Sony's newest patch
+  for it.
+- Checks each patch against your firmware and offers only the ones your
+  console can run.
+- Downloads the update into internal storage and installs it on the console.
+  Same end result as a system update, on your schedule, with the patches you
+  pick.
+- Pauses, resumes, survives reboots: a 60 GB patch picks back up where it
+  stopped after a power cut.
 
 ## The web UI
 
@@ -31,15 +31,15 @@ full-screen in the on-console browser, in any desktop browser, and on phone.
 
 The Games view groups everything you have installed into filter chips:
 
-- **Updatable** is selected by default — games with an installable update.
-- **Updating** is the queue: jobs waiting for a free slot.
-- **Up to date**, **Needs FW**, **Can't update** — the rest.
-- **All** is the flat list, top-right corner.
+- **Updatable**, selected by default: games with an installable update.
+- **Updating**: jobs waiting for a free slot in the queue.
+- **Up to date**, **Needs FW**, **Can't update**: the rest.
+- **All**: the flat list, top-right corner.
 
-**Update all** in the top bar queues everything that's installable in one
-click. A live banner above the games list shows the current title, its
-download speed, ETA, and a `3 of 9`-style position when more than one
-update is running through the queue.
+**Update all** in the top bar queues every installable update in one click.
+A live banner above the games list shows the current title, its download
+speed, ETA, and a `3 of 9`-style position when more than one update is
+running through the queue.
 
 ## Settings
 
@@ -47,7 +47,7 @@ update is running through the queue.
   <img src="docs/images/ui-mobile-settings.jpg" alt="PatchDL Settings view on phone" width="380">
 </p>
 
-Settings persist across restarts and apply live — nothing needs a reboot.
+Settings persist across restarts and apply live. No reboot needed.
 
 - **Default policy** to allow or deny new titles by default, with a per-game
   override.
@@ -61,8 +61,8 @@ Settings persist across restarts and apply live — nothing needs a reboot.
 ## Home-screen tile
 
 Toggle the shortcut on and PatchDL registers itself as a regular app on the
-PS5 home screen. Tap the tile and the on-console browser opens straight on the
-games list.
+PS5 home screen. Tap the tile and the on-console browser opens straight on
+the games list.
 
 <p align="center">
   <img src="docs/images/tv-browser.jpg" alt="The PatchDL UI in the on-console browser" width="820">
@@ -74,14 +74,14 @@ games list.
 scripts/build_ps5.sh        # produces patchdl-ps5.elf
 ```
 
-Needs the `ps5-payload-dev` SDK and the prebuilt `libcurl` + `OpenSSL` from its
-`pacbrew-repo`. `libmicrohttpd` is vendored, SQLite too.
+Needs the `ps5-payload-dev` SDK and the prebuilt `libcurl` + `OpenSSL` from
+its `pacbrew-repo`. `libmicrohttpd` is vendored, SQLite too.
 
 ## Deploy
 
-`scripts/deploy_ps5.sh` uploads the build, replaces any running instance, and
-launches the new one. On launch you get an on-screen notification with the
-exact URL to open.
+`scripts/deploy_ps5.sh` uploads the build, replaces any running instance,
+and launches the new one. On launch you get an on-screen notification with
+the exact URL to open.
 
 ```sh
 PS5_HOST=<console-ip> scripts/deploy_ps5.sh
@@ -93,9 +93,8 @@ PS5_HOST=<console-ip> scripts/deploy_ps5.sh
 
 ## License
 
-PatchDL is released under the **GNU General Public License v3.0 or later**.
-See [LICENSE](LICENSE) for the full text. In short: you're free to use, study,
-modify and share it — and any fork or derivative work has to stay under the
-same license.
+PatchDL ships under the **GNU General Public License v3.0 or later**. See
+[LICENSE](LICENSE) for the full text. Short version: use, study, modify,
+share. Forks stay under the same license.
 
 Copyright © 2026 Knutwurst.
