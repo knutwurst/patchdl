@@ -31,9 +31,11 @@
 #define PATCHDL_MAX_TOTAL_BYTES    (200ULL * 1024 * 1024 * 1024)  /* 200 GiB */
 
 /* In-RAM buffer caps for full HTTP body fetches. version.xml is a few KB,
-   manifest JSON is a few MB at most — fail-closed beyond that. */
-#define PATCHDL_BUF_MAX_VERXML     (16  * 1024 * 1024)
-#define PATCHDL_BUF_MAX_MANIFEST   (64  * 1024 * 1024)
+   manifest JSON is a few MB at most — fail-closed beyond that. The
+   manifest cap is sized for ~4096 pieces × ~3 KB JSON each with plenty of
+   headroom; real PS5 manifests are 1-2 MB. */
+#define PATCHDL_BUF_MAX_VERXML     (4   * 1024 * 1024)
+#define PATCHDL_BUF_MAX_MANIFEST   (16  * 1024 * 1024)
 
 #ifdef PATCHDL_HAVE_CURL
 /* Replacement for fopen("wb"/"r+b") that refuses to follow a symlink at the

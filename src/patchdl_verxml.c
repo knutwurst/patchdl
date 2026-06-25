@@ -183,10 +183,10 @@ patchdl_verxml_query(const char *url, uint32_t fw_bin, patchdl_verinfo_t *out) {
     if (!url || !out) return -1;
     memset(out, 0, sizeof(*out));
 
-    /* version.xml is a few KB in practice; cap to 16 MiB so a misbehaving CDN
-       can't slurp unbounded RAM into the buffer. */
+    /* version.xml is a few KB in practice; cap so a misbehaving CDN can't
+       slurp unbounded RAM into the buffer. */
     memset(&buf, 0, sizeof(buf));
-    buf.max = 16 * 1024 * 1024;
+    buf.max = 4 * 1024 * 1024;
     if (patchdl_http_get(url, &buf)) return -1;
     if (!buf.data || !buf.size) { free(buf.data); return -1; }
 

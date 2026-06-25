@@ -475,7 +475,10 @@ patchdl_install_status_json(char *out, size_t out_sz) {
     char tid[32];
     char method[32];
     int  start_rc;
-    ai_install_status_t st;
+    /* ai_install_status_t carries a 2 KB safety pad; live on the heap so
+       a frequently-polled /api/installstatus doesn't keep committing pages
+       on every MHD worker's stack. */
+    ai_install_status_t *st = NULL;
     char status[17], src_type[9];
     int  rc;
     int  progress = 0;
@@ -514,20 +517,25 @@ patchdl_install_status_json(char *out, size_t out_sz) {
         return -1;
     }
 
+    st = calloc(1, sizeof(*st));
+    if (!st) {
+        snprintf(out, out_sz, "{\"error\":\"oom\"}");
+        return -1;
+    }
+
     /* sceAppInstUtilGetInstallStatus(char *content_id_out, status_t *status):
        first arg is an OUTPUT buffer that receives the current install's content_id.
        Do NOT pass `cid` there — it would be overwritten. The visible id fits in
        0x30 bytes but Sony's NUL-pad length is unknown; use a padded buffer. */
     {
         char ai_cid_out[AI_CONTENTID_OUT_SIZE] = {0};
-        memset(&st, 0, sizeof(st));
-        rc = ai_get_status(ai_cid_out, &st);
+        rc = ai_get_status(ai_cid_out, st);
         (void)ai_cid_out; /* returned content_id for future use */
     }
-    copy_bounded(status, sizeof(status), st.status, sizeof(st.status));
-    copy_bounded(src_type, sizeof(src_type), st.src_type, sizeof(st.src_type));
-    if (st.total_size > 0)
-        progress = (int)((st.downloaded_size * 100) / st.total_size);
+    copy_bounded(status, sizeof(status), st->status, sizeof(st->status));
+    copy_bounded(src_type, sizeof(src_type), st->src_type, sizeof(st->src_type));
+    if (st->total_size > 0)
+        progress = (int)((st->downloaded_size * 100) / st->total_size);
     if (progress < 0) progress = 0;
     if (progress > 100) progress = 100;
     terminal = (!strcmp(status, "playable") ||
@@ -542,10 +550,11 @@ patchdl_install_status_json(char *out, size_t out_sz) {
              "\"promote_progress\":%u,\"error_code\":%d}",
              terminal ? "true" : "false", cid, tid, method, start_rc, rc,
              status, src_type, progress,
-             (unsigned long long)st.downloaded_size,
-             (unsigned long long)st.total_size,
-             (unsigned)st.promote_progress,
-             (int)st.error_info.error_code);
+             (unsigned long long)st->downloaded_size,
+             (unsigned long long)st->total_size,
+             (unsigned)st->promote_progress,
+             (int)st->error_info.error_code);
+    free(st);
     return rc;
 }
 

@@ -283,7 +283,14 @@ queue_buffer(struct MHD_Connection *conn, unsigned int status,
     enum MHD_Result      ret;
 
     resp = MHD_create_response_from_buffer(size, (void *)data, mm);
-    if (!resp) return MHD_NO;
+    if (!resp) {
+        /* MUST_FREE hands ownership to MHD on success; on failure we still
+           own it and have to free it ourselves or the caller's strdup'd
+           JSON leaks. PERSISTENT/MUST_COPY buffers are caller-owned and
+           we leave them alone. */
+        if (mm == MHD_RESPMEM_MUST_FREE) free((void *)data);
+        return MHD_NO;
+    }
 
     MHD_add_response_header(resp, MHD_HTTP_HEADER_ACCESS_CONTROL_ALLOW_ORIGIN, "*");
     MHD_add_response_header(resp, MHD_HTTP_HEADER_CACHE_CONTROL, "no-store");
@@ -1129,7 +1136,11 @@ write_job_state(const dl_job_t *job) {
    ps[] states and done_bytes. Called with the pool lock held. */
 static void
 seed_from_sidecar(dl_job_t *job) {
-    char       path[320], buf[16384], murl[768];
+    /* 8 KB sidecar buffer: 4096-piece cap × 2 hex chars / 8 bits = 1024 hex
+       chars for the bitmap, plus the JSON wrapper and the up-to-768-byte
+       manifest_url — fits with room. Halved from 16 KB to lighten the
+       per-admit stack frame on the pool worker. */
+    char       path[320], buf[8192], murl[768];
     FILE      *f;
     size_t     n;
     int        nbytes = (job->mf.count + 7) / 8;
@@ -2341,11 +2352,16 @@ patchdl_websrv_start(unsigned short port) {
         MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_THREAD_PER_CONNECTION,
         port, NULL, NULL, &on_request, NULL,
         MHD_OPTION_NOTIFY_COMPLETED, request_completed, NULL,
-        /* DoS guards: bound concurrent sockets + per-IP to keep a misbehaving
-           LAN client from exhausting pthreads on the PS5. */
-        MHD_OPTION_CONNECTION_LIMIT,        (unsigned int)64,
+        /* DoS guards + RAM caps: the PS5 process budget is a few hundred MB
+           and the default pthread stack on this libc is multiple MB. We're
+           a single-user UI — 8 concurrent connections is plenty for the
+           SSE poll + a couple of AJAX, and 256 KB per worker is more than
+           enough for our handlers (largest stack use is a 16 KB sidecar
+           buffer in seed_from_sidecar). */
+        MHD_OPTION_CONNECTION_LIMIT,        (unsigned int)8,
         MHD_OPTION_PER_IP_CONNECTION_LIMIT, (unsigned int)8,
         MHD_OPTION_CONNECTION_TIMEOUT,      (unsigned int)30,
+        MHD_OPTION_THREAD_STACK_SIZE,       (size_t)(512 * 1024),
         MHD_OPTION_END);
 
     if (!web_daemon) {
@@ -2398,11 +2414,19 @@ patchdl_websrv_stop(void) {
     for (int s = 0; s < g_pool.n_workers; s++)
         pthread_join(g_pool.workers[s], NULL);
     g_pool.n_workers = 0;
+    /* Free every job still in the pool list. Workers have joined so nobody
+       else touches the list. free_job_locked unlinks + frees mf.pieces[i].url,
+       mf.pieces, ps, bitmap, and closes the fd. */
+    pthread_mutex_lock(&g_pool.mtx);
+    while (g_pool.jobs) free_job_locked(g_pool.jobs);
+    pthread_mutex_unlock(&g_pool.mtx);
     patchdl_net_global_cleanup();
 
     pthread_mutex_lock(&g_mutex);
     patchdl_scan_free(g_titles, g_title_count);
     g_titles      = NULL;
     g_title_count = 0;
+    free(g_debug_json);
+    g_debug_json  = NULL;
     pthread_mutex_unlock(&g_mutex);
 }
