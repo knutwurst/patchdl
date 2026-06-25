@@ -1,140 +1,96 @@
 # PatchDL
 
-A standalone PlayStation 5 ELF payload that downloads and installs official game
-patches on your terms. It serves its own dark-mode web UI and runs without
-etaHEN.
+A self-contained patch downloader and installer for the PS5, with its own
+dark-mode web UI. Drop it on the console, open the URL on any device on the
+same network, pick the games you want patched.
 
-PatchDL is built for setups where nanoDNS blocks Sony's servers for the whole
-console. It resolves the Sony patch CDN on its own DNS path, so the rest of the
-system stays offline and only the patches you pick get fetched.
-
-by Knutwurst
+<p align="center">
+  <img src="docs/images/tile-homescreen.jpg" alt="PatchDL on the PS5 home screen" width="720">
+</p>
 
 ## What it does
 
-- Scans installed titles and classifies each: genuine install, ShadowMountPlus
-  mount, preinstall, or unknown.
-- Reads the title name, installed version, and Sony `version.xml` URL from the
-  PS5 app database.
-- Fetches each title's `version.xml` past nanoDNS (a raw DNS query to 1.1.1.1)
-  and verifies TLS against the pinned SCEI DNAS root.
-- Picks the newest patch compatible with the current firmware
-  (`system_ver <= firmware`), so an update never forces a firmware upgrade.
-- Downloads the patch from Sony's manifest pieces into one local `.pkg`, then
-  installs it through Sony's AppInstUtil service.
+- Lists every game installed on your console and looks up the newest update
+  Sony has published for it.
+- Compares the available patch against your firmware and only offers updates
+  that will actually run on the system you have.
+- Downloads the update package into internal storage and installs it
+  on-console — same end result as a normal system update, with you in control
+  of when and what.
+- Pauses, resumes, and survives reboots: a 60 GB patch can be picked up where
+  it left off after a power-cycle.
 
-## Downloading
+## The web UI
 
-PatchDL pulls each patch over a pool of connections instead of one stream, which
-lifts the ~7 MB/s per-connection ceiling on the Sony CDN. Set the connection
-count (1 to 16) in Settings with the stepper; the change applies live, with no
-payload restart. One patch downloads at a time and further requests queue.
+Open `http://<console-ip>:12880/` in any browser on the network. The UI works
+full-screen in the on-console browser, in any desktop browser, and on phone.
 
-Downloads survive interruptions:
+<p align="center">
+  <img src="docs/images/ui-desktop.jpg" alt="PatchDL Games view in a desktop browser" width="1100">
+</p>
 
-- **Resume across a reboot.** PatchDL records progress per manifest piece in a
-  sidecar beside the `.pkg`, written after every completed piece, so a reboot or
-  relaunch continues where it stopped.
-- **Pause, Resume, Cancel.** Pause keeps the partial file, Resume continues it,
-  Cancel deletes it. All three work at any point in a download.
-- **Verification.** Turn on "Verify downloaded pieces (SHA-256)" to check each
-  piece against its manifest hash while downloading. After a download you can
-  also verify the assembled package on-device against Sony's per-piece hashes
-  (`GET /api/pkgverify/<title_id>`).
+The Games view groups everything you have installed into filter chips:
 
-Patches download to `/data/patchdl` on the internal SSD. Large retail updates
-run tens of GB.
-
-## Web UI
-
-The Games view groups titles into filter chips:
-
-- **Updatable** — has an installable update; selected by default.
-- **Updating** — queued, actively downloading, paused with a partial on disk,
-  or installing.
+- **Updatable** is selected by default — games with an installable update.
+- **Updating** is the queue: jobs waiting for a free slot.
 - **Up to date**, **Needs FW**, **Can't update** — the rest.
-- **All** — flat list at the right end of the strip.
+- **All** is the flat list, top-right corner.
 
-**Update all** in the top bar queues a download for every game with an
-installable update in one click. Shadowmounts are skipped (they pass the
-download policy but not the install policy), so a sweep doesn't burn tens of
-GB on bytes AppInstUtil would refuse — pick those up by hand when the disc is
-ready.
-
-## Safety model
-
-Deny-by-default. A patch installs only for a genuine install, and only when the
-patch metadata targets the installed game:
-
-| Source                | Check | Download | Install |
-|-----------------------|-------|----------|---------|
-| official              | yes   | yes      | yes     |
-| shadowmount           | yes   | yes      | no      |
-| preinstall / unknown  | yes   | no       | no      |
-
-Two guards stop the wrong target being installed: the patch target id (from
-`version.xml` / `manifest_url`) must match the installed game, and the install
-call receives the installed game's content id from app.db. PatchDL refuses a
-true target-title mismatch rather than installing a phantom title.
-
-All writes stay under `/data/patchdl`. PatchDL never writes to the system
-partition and never touches firmware.
+**Update all** in the top bar queues everything that's installable in one
+click. A live banner above the games list shows the current title, its
+download speed, ETA, and a `3 of 9`-style position when more than one
+update is running through the queue.
 
 ## Settings
 
-Settings persist to `/data/patchdl/config.json` and survive a restart:
+<p align="center">
+  <img src="docs/images/ui-mobile-settings.jpg" alt="PatchDL Settings view on phone" width="380">
+</p>
 
-- Default policy (allow or deny) and a per-game enable toggle.
-- Install after download, as a global default with a per-game override.
-- Delete the PKG after a successful install.
-- Verify downloaded pieces (SHA-256).
-- Parallel download connections (1 to 16), applied live.
+Settings persist across restarts and apply live — nothing needs a reboot.
+
+- **Default policy** to allow or deny new titles by default, with a per-game
+  override.
+- **Install after download** so a finished update applies itself.
+- **Delete the package after install** to reclaim the disk space.
+- **Verify downloaded pieces** with a checksum while transferring.
+- **Home-screen shortcut** that drops a PatchDL tile on the PS5 home menu;
+  tapping the tile opens the web UI in the on-console browser.
+- **Parallel download connections** (1–16), tunable on the fly.
+
+## Home-screen tile
+
+Toggle the shortcut on and PatchDL registers itself as a regular app on the
+PS5 home screen. Tap the tile and the on-console browser opens straight on the
+games list.
+
+<p align="center">
+  <img src="docs/images/tv-browser.jpg" alt="The PatchDL UI in the on-console browser" width="820">
+</p>
 
 ## Build
-
-Requires `ps5-payload-dev/sdk`. The network and install features need the
-prebuilt libcurl + OpenSSL from `ps5-payload-dev/pacbrew-repo` in the SDK sysroot
-(`target/user/homebrew`); `scripts/build_ps5.sh` enables them when present.
-libmicrohttpd is vendored under `vendor/etahen`, SQLite under `vendor/sqlite`.
 
 ```sh
 scripts/build_ps5.sh        # produces patchdl-ps5.elf
 ```
 
+Needs the `ps5-payload-dev` SDK and the prebuilt `libcurl` + `OpenSSL` from its
+`pacbrew-repo`. `libmicrohttpd` is vendored, SQLite too.
+
 ## Deploy
 
-This console uses the BD-JB autoloader with itsPLK's Payload Manager on port 8084
-(not a 9021 elfldr). `scripts/deploy_ps5.sh` uploads the version-named ELF
-(`patchdl_<version>.elf`, so Payload Manager picks the version out of the
-filename) and launches it; the payload replaces any running instance.
+`scripts/deploy_ps5.sh` uploads the build, replaces any running instance, and
+launches the new one. On launch you get an on-screen notification with the
+exact URL to open.
 
 ```sh
 PS5_HOST=<console-ip> scripts/deploy_ps5.sh
 ```
 
-On start it shows an on-screen notification with the URL. Open the web UI at:
+<p align="center">
+  <img src="docs/images/startup-toast.jpg" alt="On-screen notification with the web UI URL" width="640">
+</p>
 
-```text
-http://<console-ip>:12880/
-```
+## License
 
-## Status
-
-Verified on firmware 11.60: title scan, source classification, version
-resolution past the nanoDNS block, firmware-compatibility filtering, the parallel
-download pool, reboot-safe resume, and on-device SHA-256 verification.
-
-Install works through Sony's AppInstUtil. `sceAppInstUtilInstallByPackage` is
-unavailable from the homebrew payload context (rejected with `0x80B21163`
-outside the system process), so PatchDL routes through
-`sceAppInstUtilAppInstallPkg` — the simpler API that reads the PKG's embedded
-`content_id` and binds the install to the right title slot. Verified
-end-to-end: Dead Island 2 (`PPSA03099`) updated from 01.000.001 to 01.000.011
-on 11.60, including the cross-region shared-storage case where Sony serves the
-patch under a master title id.
-
-`/api/installstatus` reports installer progress once
-`sceAppInstUtilGetInstallStatus` finishes the queued task.
-
-Disc games still need the disc inserted for their patch to apply, which is a
-normal Sony requirement; that's why shadowmounts are download-only by policy.
+by Knutwurst
