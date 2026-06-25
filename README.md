@@ -5,7 +5,7 @@ dark-mode web UI. Drop it on the console, open the URL on any device on the
 same network, pick the games you want patched.
 
 <p align="center">
-  <img src="docs/images/tile-homescreen.jpg" alt="PatchDL on the PS5 home screen" width="720">
+  <img src="docs/images/tv-browser.jpg" alt="The PatchDL UI in the on-console browser" width="820">
 </p>
 
 ## What it does
@@ -65,7 +65,7 @@ PS5 home screen. Tap the tile and the on-console browser opens straight on
 the games list.
 
 <p align="center">
-  <img src="docs/images/tv-browser.jpg" alt="The PatchDL UI in the on-console browser" width="820">
+  <img src="docs/images/tile-homescreen.jpg" alt="PatchDL tile on the PS5 home screen" width="720">
 </p>
 
 ## Build
