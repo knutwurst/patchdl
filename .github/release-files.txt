@@ -1,0 +1,6 @@
+# Files included in the release archive.
+# One path per line, relative to the repository root.
+
+patchdl-ps5.elf
+README.md
+LICENSE
