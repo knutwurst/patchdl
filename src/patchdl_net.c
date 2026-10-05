@@ -67,7 +67,6 @@ static const char *ALLOWED_HOSTS[] = {
     "sgst.prod.dl.playstation.net",
     "gst.prod.dl.playstation.net",
     "gs2.ww.prod.dl.playstation.net",
-    "prosperopatches.com",
     NULL,
 };
 

@@ -52,16 +52,6 @@ lookup_tsv(const char *title_id, char *url_out, size_t url_sz) {
     return -1;
 }
 
-static int
-lookup_prosperopatches(const char *title_id, char *url_out, size_t url_sz) {
-    /* TODO: implement live lookup once API endpoint is confirmed on-device.
-       prosperopatches.com serves Sony CDN index links for PS5 titles. */
-    (void)title_id;
-    (void)url_out;
-    (void)url_sz;
-    return -1;
-}
-
 int
 patchdl_resolve_url(const char *title_id, char *url_out, size_t url_sz) {
     if (!title_id) return -1;
@@ -74,8 +64,5 @@ patchdl_resolve_url(const char *title_id, char *url_out, size_t url_sz) {
         strncmp(title_id, "PPSC", 4))
         return -1;
 
-    if (!lookup_tsv(title_id, url_out, url_sz))
-        return 0;
-
-    return lookup_prosperopatches(title_id, url_out, url_sz);
+    return lookup_tsv(title_id, url_out, url_sz);
 }
