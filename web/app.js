@@ -378,7 +378,8 @@ function createGameCard(game) {
       <span>${escapeHtml(game.content_id || "")}</span>
     </div>
     <div class="pills">
-      ${game.downloading ? `<span class="pill live">Downloading</span>` : ""}
+      ${game.downloading && game._jobState === "queued" ? `<span class="pill">Queued</span>` : ""}
+      ${game.downloading && game._jobState !== "queued" ? `<span class="pill live">Downloading</span>` : ""}
       ${game.resumable && !game.downloading ? `<span class="pill warn">Paused</span>` : ""}
       ${statusPill(game)}
       ${storagePill(game)}
